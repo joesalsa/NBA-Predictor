@@ -4,15 +4,89 @@ import requests
 import libsql
 from contextlib import contextmanager
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse  # <--- 1. ASEGÚRATE DE TENER ESTO ARRIBA
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
-# ... (Tus variables de Turso y la función db()) ...
-# ... (La función init_db()) ...
-# ... (La función normal_cdf()) ...
-# ... (La función get_nba_stats()) ...
+# ==========================================
+# VARIABLES DE ENTORNO
+# ==========================================
+TURSO_URL     = os.environ.get("TURSO_DATABASE_URL")
+TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
 
+# ==========================================
+# CONEXIÓN A TURSO
+# ==========================================
+@contextmanager
+def db():
+    con = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+def init_db():
+    with db() as con:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS pregame_lines (
+                event_id TEXT PRIMARY KEY,
+                matchup TEXT,
+                line REAL,
+                kickoff_time TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS alertas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT,
+                matchup TEXT,
+                regla INTEGER,
+                checkpoint TEXT,
+                pregame_line REAL,
+                proyeccion REAL,
+                target_line REAL,
+                decision TEXT,
+                live_line_at_alert REAL,
+                cuota REAL,
+                status TEXT DEFAULT 'PENDING',
+                final_total INTEGER,
+                created_at TEXT,
+                UNIQUE(event_id, regla)
+            );
+        """)
+
+# ==========================================
+# MATEMÁTICA Y ESTADÍSTICAS
+# ==========================================
+def normal_cdf(x, mu=0, sigma=1):
+    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+
+def get_nba_stats():
+    stats_dict = {}
+    try:
+        url = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        for conf in data.get("children", []):
+            for entry in conf.get("standings", {}).get("entries", []):
+                team_name = entry["team"]["displayName"]
+                stats = entry.get("stats", [])
+                pts_for = 110.0
+                pts_against = 110.0
+                for s in stats:
+                    if s.get("name") == "avgPointsFor":
+                        pts_for = float(s.get("value", 110.0))
+                    elif s.get("name") == "avgPointsAgainst":
+                        pts_against = float(s.get("value", 110.0))
+                stats_dict[team_name] = {"pf": pts_for, "pa": pts_against}
+    except Exception as e:
+        print(f"Error stats: {e}")
+    return stats_dict
+
+# ==========================================
+# RUTAS
+# ==========================================
 @app.get("/")
 def read_root():
     try:
@@ -21,9 +95,6 @@ def read_root():
     except Exception as e:
         return {"error": str(e)}
 
-# =========================================================================
-# 2. AQUI ABAJO VA EL CÓDIGO NUEVO (Borra el viejo predictor_json y pega este)
-# =========================================================================
 @app.get("/predictor", response_class=HTMLResponse)
 def predictor_html():
     stats = get_nba_stats()
@@ -129,10 +200,6 @@ def predictor_html():
     </html>
     """
     return html_out
-
-# =========================================================================
-# FIN DEL CODIGO NUEVO
-# =========================================================================
 
 if __name__ == "__main__":
     import uvicorn
