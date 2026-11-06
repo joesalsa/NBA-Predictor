@@ -3,11 +3,10 @@ import os
 import requests
 import libsql
 from datetime import datetime, timezone
-from contextlib import contextmanager
-from fastapi import FastAPI, BackgroundTasks
+from contextlib import contextmanager, asynccontextmanager
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-
-app = FastAPI()
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ==========================================
 # VARIABLES DE ENTORNO
@@ -15,6 +14,22 @@ app = FastAPI()
 TURSO_URL     = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
 ODDS_API_KEY  = os.environ.get("ODDS_API_KEY")
+
+# ==========================================
+# SCHEDULER Y LIFESPAN
+# ==========================================
+scheduler = BackgroundScheduler(timezone="UTC")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Arrancar el bot en segundo plano cada 30 minutos
+    scheduler.add_job(procesar_mercado, "interval", minutes=30, id="zcode_job", coalesce=True, max_instances=1)
+    scheduler.start()
+    print("🚀 Scheduler iniciado: Buscando valor cada 30 minutos.")
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(lifespan=lifespan)
 
 # ==========================================
 # CONEXIÓN A TURSO
@@ -78,9 +93,6 @@ def get_nba_stats():
         print(f"Error stats: {e}")
     return stats_dict
 
-# ==========================================
-# NORMALIZADOR DE NOMBRES
-# ==========================================
 def get_team_key(name):
     n = name.lower()
     if "hawks" in n or "atl" in n: return "ATL"
@@ -115,9 +127,6 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "WAS"
     return n
 
-# ==========================================
-# BUSCAR CUOTAS
-# ==========================================
 def buscar_cuotas_oddsapi(away_name, home_name):
     if not ODDS_API_KEY: return None
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
@@ -152,25 +161,23 @@ def buscar_cuotas_oddsapi(away_name, home_name):
     return None
 
 # ==========================================
-# GUARDAR PREDICCIÓN EN TURSO
+# LÓGICA DEL BOT EN SEGUNDO PLANO
 # ==========================================
 def guardar_prediccion(event_id, partido, pick, linea, cuota, edge):
-    with db() as con:
-        # INSERT OR IGNORE evita duplicados si recargas la página
-        con.execute("""
-            INSERT OR IGNORE INTO predicciones_zcode 
-            (event_id, fecha, partido, pick, linea, cuota, edge, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
-        """, (event_id, datetime.now(timezone.utc).isoformat(), partido, pick, linea, cuota, edge))
+    try:
+        with db() as con:
+            con.execute("""
+                INSERT OR IGNORE INTO predicciones_zcode 
+                (event_id, fecha, partido, pick, linea, cuota, edge, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            """, (event_id, datetime.now(timezone.utc).isoformat(), partido, pick, linea, cuota, edge))
+    except Exception as e:
+        print(f"Error guardando: {e}")
 
-# ==========================================
-# AUDITOR DE RESULTADOS (SE EJECUTA EN SEGUNDO PLANO)
-# ==========================================
 def auditar_predicciones():
     try:
         with db() as con:
             pendientes = con.execute("SELECT id, event_id, pick, linea FROM predicciones_zcode WHERE status='PENDING'").fetchall()
-        
         if not pendientes: return
 
         r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
@@ -180,67 +187,48 @@ def auditar_predicciones():
             g = games.get(event_id)
             if not g: continue
             
-            # Si el partido ya terminó
             if g.get("status", {}).get("type", {}).get("state") == "post":
                 comp = g.get("competitions", [{}])[0]
                 cs = comp.get("competitors", [])
                 home = next((c for c in cs if c.get("homeAway") == "home"), None)
                 away = next((c for c in cs if c.get("homeAway") == "away"), None)
-                
                 if not home or not away: continue
                 
                 pts_home = int(home.get("score", 0))
                 pts_away = int(away.get("score", 0))
                 
-                # Verificar si el pick fue Local o Visita
                 is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
                 
-                # Cálculo del Spread
                 if is_home_pick:
                     margen_final = (pts_home - pts_away) + linea
                 else:
                     margen_final = (pts_away - pts_home) + linea
                     
-                if margen_final > 0:
-                    status = "WON"
-                elif margen_final < 0:
-                    status = "LOST"
-                else:
-                    status = "PUSH"
+                if margen_final > 0: status = "WON"
+                elif margen_final < 0: status = "LOST"
+                else: status = "PUSH"
                     
                 with db() as con:
-                    con.execute("""
-                        UPDATE predicciones_zcode 
-                        SET status=?, puntos_home=?, puntos_away=? 
-                        WHERE id=?
-                    """, (status, pts_home, pts_away, pred_id))
+                    con.execute("UPDATE predicciones_zcode SET status=?, puntos_home=?, puntos_away=? WHERE id=?", (status, pts_home, pts_away, pred_id))
                     
-                print(f"Auditoría Zcode: {pick} {linea} -> {status} (Final: {pts_home}-{pts_away})")
+                print(f"✅ Auditado: {pick} {linea} -> {status} (Final: {pts_home}-{pts_away})")
     except Exception as e:
-        print(f"Error en auditoría: {e}")
+        print(f"Error auditoría: {e}")
 
-# ==========================================
-# RUTAS
-# ==========================================
-@app.get("/")
-def read_root():
-    return {"mensaje": "Zcode Predictor Activo. Ve a /predictor o /historial"}
-
-@app.get("/predictor", response_class=HTMLResponse)
-def predictor_html(background_tasks: BackgroundTasks):
-    # Lanzamos el auditor en segundo plano cada vez que se abre la página
-    background_tasks.add_task(auditar_predicciones)
-
+def procesar_mercado():
+    """Esta función corre cada 30 minutos en Render."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Escaneando mercado NBA...")
     stats = get_nba_stats()
     try:
         r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games_raw = r.json().get("events", [])
     except Exception:
-        return HTMLResponse("<h1>Error cargando partidos</h1>")
+        return
 
-    html_cards = ""
-    
     for ev in games_raw:
+        # Solo analizamos partidos que no han empezado
+        if ev.get("status", {}).get("type", {}).get("state") != "pre": continue
+
         comp = ev.get("competitions", [{}])[0]
         cs = comp.get("competitors", [])
         if len(cs) < 2: continue
@@ -260,9 +248,65 @@ def predictor_html(background_tasks: BackgroundTasks):
         proy_away = (a_pf + h_pa) / 2 - 1.25
         margen = proy_home - proy_away
         
+        cuotas = buscar_cuotas_oddsapi(a_name, h_name)
+        
+        if cuotas and cuotas.get("spread"):
+            home_line, home_odds = cuotas["spread"]["home_line"], cuotas["spread"]["home_odds"]
+            away_line, away_odds = cuotas["spread"]["away_line"], cuotas["spread"]["away_odds"]
+            
+            prob_home_spread = normal_cdf((margen + home_line) / 11.5) * 100
+            prob_away_spread = normal_cdf((-margen + away_line) / 11.5) * 100
+            
+            edge_home = prob_home_spread - (100 / home_odds) if home_odds > 1.0 else -100
+            edge_away = prob_away_spread - (100 / away_odds) if away_odds > 1.0 else -100
+            
+            if edge_home > 3.0:
+                guardar_prediccion(event_id, f"{a_name} vs {h_name}", h_name, home_line, home_odds, edge_home)
+            elif edge_away > 3.0:
+                guardar_prediccion(event_id, f"{a_name} vs {h_name}", a_name, away_line, away_odds, edge_away)
+                
+    # Después de buscar valores, actualizamos los resultados viejos
+    auditar_predicciones()
+
+# ==========================================
+# RUTAS WEB
+# ==========================================
+@app.get("/")
+def read_root():
+    return {"mensaje": "Bot en segundo plano activo. Ve a /predictor o /historial"}
+
+@app.get("/predictor", response_class=HTMLResponse)
+def predictor_html():
+    stats = get_nba_stats()
+    try:
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
+        games_raw = r.json().get("events", [])
+    except Exception:
+        return HTMLResponse("<h1>Error cargando partidos</h1>")
+
+    html_cards = ""
+    
+    for ev in games_raw:
+        comp = ev.get("competitions", [{}])[0]
+        cs = comp.get("competitors", [])
+        if len(cs) < 2: continue
+        home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
+        away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
+        
+        h_name = home.get("team", {}).get("displayName", "")
+        a_name = away.get("team", {}).get("displayName", "")
+        
+        if h_name not in stats or a_name not in stats: continue
+            
+        h_pf, h_pa = stats[h_name]['pf'], stats[h_name]['pa']
+        a_pf, a_pa = stats[a_name]['pf'], stats[a_name]['pa']
+        
+        proy_home = (h_pf + a_pa) / 2 + 1.25
+        proy_away = (a_pf + h_pa) / 2 - 1.25
+        margen = proy_home - proy_away
+        
         prob_home = normal_cdf(margen / 11.5) * 100
         prob_away = 100 - prob_home
-        
         favorito = h_name if prob_home > prob_away else a_name
         prob_fav = prob_home if prob_home > prob_away else prob_away
         
@@ -287,9 +331,6 @@ def predictor_html(background_tasks: BackgroundTasks):
                     <div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div>
                 </div>
                 """
-                # GUARDAR EN TURSO
-                guardar_prediccion(event_id, f"{a_name} vs {h_name}", h_name, home_line, home_odds, edge_home)
-                
             elif edge_away > 3.0:
                 valor_html = f"""
                 <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
@@ -298,9 +339,6 @@ def predictor_html(background_tasks: BackgroundTasks):
                     <div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div>
                 </div>
                 """
-                # GUARDAR EN TURSO
-                guardar_prediccion(event_id, f"{a_name} vs {h_name}", a_name, away_line, away_odds, edge_away)
-                
             else:
                 valor_html = f"""
                 <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
@@ -361,9 +399,7 @@ def predictor_html(background_tasks: BackgroundTasks):
         </style>
     </head>
     <body>
-        <div class="nav">
-            <a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a>
-        </div>
+        <div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div>
         <h2 style="font-size: 18px; margin-bottom: 20px;">ZCODE AI - Predicciones</h2>
         {html_cards if html_cards else "<p style='text-align:center;'>No hay partidos programados para hoy.</p>"}
     </body>
@@ -382,15 +418,9 @@ def historial_html():
     
     for r in rows:
         fecha, partido, pick, linea, cuota, edge, status, ph, pa = r
-        if status == 'WON': 
-            color = "#10b981"
-            bg = "rgba(16, 185, 129, 0.1)"
-        elif status == 'LOST': 
-            color = "#ef4444"
-            bg = "rgba(239, 68, 68, 0.1)"
-        else:
-            color = "#eab308"
-            bg = "rgba(234, 179, 8, 0.1)"
+        if status == 'WON': color = "#10b981"; bg = "rgba(16, 185, 129, 0.1)"
+        elif status == 'LOST': color = "#ef4444"; bg = "rgba(239, 68, 68, 0.1)"
+        else: color = "#eab308"; bg = "rgba(234, 179, 8, 0.1)"
             
         score_txt = f"{ph} - {pa}" if ph is not None else "-"
         
@@ -427,9 +457,7 @@ def historial_html():
         </style>
     </head>
     <body>
-        <div class="nav">
-            <a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a>
-        </div>
+        <div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div>
         <h2 style="font-size: 18px; margin-bottom: 20px;">Historial de Apuestas</h2>
         
         <div class="stats">
