@@ -89,10 +89,7 @@ def get_nba_stats():
 # NORMALIZADOR DE NOMBRES (ESPN vs ODDS API)
 # ==========================================
 def get_team_key(name):
-    """Convierte cualquier nombre de equipo al formato oficial de 3 letras (Ej: GSW, LAL)."""
     n = name.lower()
-    
-    # Mapeo exhaustivo de nombres comunes y abreviaturas
     if "hawks" in n or "atl" in n: return "ATL"
     if "celtics" in n or "bos" in n: return "BOS"
     if "nets" in n or "bkn" in n: return "BKN"
@@ -123,7 +120,6 @@ def get_team_key(name):
     if "raptors" in n or "tor" in n: return "TOR"
     if "jazz" in n or "uta" in n: return "UTA"
     if "wizards" in n or "was" in n: return "WAS"
-    
     return n
 
 # ==========================================
@@ -152,13 +148,12 @@ def buscar_cuotas_oddsapi(away_name, home_name):
             h_api = game.get("home_team", "")
             a_api = game.get("away_team", "")
             
-            # Ahora comparamos las llaves (ATL, GSW, etc.) en lugar de los nombres completos
             if get_team_key(h_api) == get_team_key(home_name) and get_team_key(a_api) == get_team_key(away_name):
                 
                 bookmakers = game.get("bookmakers", [])
                 if not bookmakers: return None
                 
-                book = bookmakers[0] # Tomamos la primera casa (DraftKings, FanDuel, etc.)
+                book = bookmakers[0]
                 markets = book.get("markets", [])
                 
                 cuotas = {"spread": None, "moneyline": None}
@@ -255,9 +250,9 @@ def predictor_html():
             away_line = cuotas["spread"]["away_line"]
             away_odds = cuotas["spread"]["away_odds"]
             
-            # Probabilidad real de cubrir el spread
-            prob_home_spread = normal_cdf((margen - home_line) / 11.5) * 100
-            prob_away_spread = normal_cdf((-margen - away_line) / 11.5) * 100
+            # Probabilidad real de cubrir el spread (CORREGIDO: sumando las líneas)
+            prob_home_spread = normal_cdf((margen + home_line) / 11.5) * 100
+            prob_away_spread = normal_cdf((-margen + away_line) / 11.5) * 100
             
             # Calcular Edge (Valor) vs Casa
             edge_home = prob_home_spread - (100 / home_odds) if home_odds > 1.0 else -100
