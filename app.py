@@ -22,10 +22,10 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Arrancar el bot en segundo plano cada 30 minutos
-    scheduler.add_job(procesar_mercado, "interval", minutes=30, id="zcode_job", coalesce=True, max_instances=1)
+    # Escanea cada 60 minutos en lugar de 30 para ahorrar aún más
+    scheduler.add_job(procesar_mercado, "interval", minutes=60, id="zcode_job", coalesce=True, max_instances=1)
     scheduler.start()
-    print("🚀 Scheduler iniciado: Buscando valor cada 30 minutos.")
+    print("🚀 Scheduler iniciado: Optimizado para gastar 1 crédito por hora.")
     yield
     scheduler.shutdown()
 
@@ -65,33 +65,10 @@ def init_db():
 init_db()
 
 # ==========================================
-# MATEMÁTICA Y ESTADÍSTICAS
+# MATEMÁTICA Y NORMALIZADOR
 # ==========================================
 def normal_cdf(x, mu=0, sigma=1):
     return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
-
-def get_nba_stats():
-    stats_dict = {}
-    try:
-        url = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        for conf in data.get("children", []):
-            for entry in conf.get("standings", {}).get("entries", []):
-                team_name = entry["team"]["displayName"]
-                stats = entry.get("stats", [])
-                pts_for = 110.0
-                pts_against = 110.0
-                for s in stats:
-                    if s.get("name") == "avgPointsFor":
-                        pts_for = float(s.get("value", 110.0))
-                    elif s.get("name") == "avgPointsAgainst":
-                        pts_against = float(s.get("value", 110.0))
-                stats_dict[team_name] = {"pf": pts_for, "pa": pts_against}
-    except Exception as e:
-        print(f"Error stats: {e}")
-    return stats_dict
 
 def get_team_key(name):
     n = name.lower()
@@ -127,38 +104,78 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "WAS"
     return n
 
-def buscar_cuotas_oddsapi(away_name, home_name):
-    if not ODDS_API_KEY: return None
+def get_nba_stats():
+    stats_dict = {}
+    try:
+        url = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        for conf in data.get("children", []):
+            for entry in conf.get("standings", {}).get("entries", []):
+                team_name = entry["team"]["displayName"]
+                stats = entry.get("stats", [])
+                pts_for = 110.0
+                pts_against = 110.0
+                for s in stats:
+                    if s.get("name") == "avgPointsFor": pts_for = float(s.get("value", 110.0))
+                    elif s.get("name") == "avgPointsAgainst": pts_against = float(s.get("value", 110.0))
+                stats_dict[team_name] = {"pf": pts_for, "pa": pts_against}
+    except Exception as e:
+        print(f"Error stats: {e}")
+    return stats_dict
+
+# ==========================================
+# OPTIMIZACIÓN DE CRÉDITOS: 1 SOLA PETICIÓN
+# ==========================================
+def get_all_nba_odds():
+    """Trae las cuotas de TODOS los partidos de la NBA en 1 sola petición (gasta 1 crédito)."""
+    if not ODDS_API_KEY: return {}
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
     params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "spreads,h2h", "oddsFormat": "decimal"}
+    
     try:
         r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200: return None
+        
+        # Imprimir en consola los créditos restantes
+        remaining = r.headers.get("x-requests-remaining", "Desconocido")
+        print(f"🔋 Créditos restantes en The Odds API: {remaining}")
+
+        if r.status_code != 200: return {}
         games = r.json()
+        
+        odds_dict = {}
         for game in games:
             h_api = game.get("home_team", "")
             a_api = game.get("away_team", "")
-            if get_team_key(h_api) == get_team_key(home_name) and get_team_key(a_api) == get_team_key(away_name):
-                bookmakers = game.get("bookmakers", [])
-                if not bookmakers: return None
-                book = bookmakers[0]
-                markets = book.get("markets", [])
-                cuotas = {"spread": None}
-                for market in markets:
-                    if market.get("key") == "spreads":
-                        spread_data = {}
-                        for out in market.get("outcomes", []):
-                            if get_team_key(out.get("name", "")) == get_team_key(home_name):
-                                spread_data["home_line"] = float(out.get("point", 0))
-                                spread_data["home_odds"] = float(out.get("price", 0))
-                            elif get_team_key(out.get("name", "")) == get_team_key(away_name):
-                                spread_data["away_line"] = float(out.get("point", 0))
-                                spread_data["away_odds"] = float(out.get("price", 0))
-                        if len(spread_data) == 4: cuotas["spread"] = spread_data
-                return cuotas
-    except Exception:
-        pass
-    return None
+            key = f"{get_team_key(a_api)}_vs_{get_team_key(h_api)}"
+            
+            bookmakers = game.get("bookmakers", [])
+            if not bookmakers: continue
+            
+            book = bookmakers[0]
+            markets = book.get("markets", [])
+            cuotas = {"spread": None}
+            
+            for market in markets:
+                if market.get("key") == "spreads":
+                    spread_data = {}
+                    for out in market.get("outcomes", []):
+                        if get_team_key(out.get("name", "")) == get_team_key(h_api):
+                            spread_data["home_line"] = float(out.get("point", 0))
+                            spread_data["home_odds"] = float(out.get("price", 0))
+                        elif get_team_key(out.get("name", "")) == get_team_key(a_api):
+                            spread_data["away_line"] = float(out.get("point", 0))
+                            spread_data["away_odds"] = float(out.get("price", 0))
+                    if len(spread_data) == 4: cuotas["spread"] = spread_data
+            
+            if cuotas["spread"]:
+                odds_dict[key] = cuotas
+                
+        return odds_dict
+    except Exception as e:
+        print(f"Error OddsAPI: {e}")
+        return {}
 
 # ==========================================
 # LÓGICA DEL BOT EN SEGUNDO PLANO
@@ -171,8 +188,7 @@ def guardar_prediccion(event_id, partido, pick, linea, cuota, edge):
                 (event_id, fecha, partido, pick, linea, cuota, edge, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
             """, (event_id, datetime.now(timezone.utc).isoformat(), partido, pick, linea, cuota, edge))
-    except Exception as e:
-        print(f"Error guardando: {e}")
+    except Exception: pass
 
 def auditar_predicciones():
     try:
@@ -198,37 +214,38 @@ def auditar_predicciones():
                 pts_away = int(away.get("score", 0))
                 
                 is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
-                
-                if is_home_pick:
-                    margen_final = (pts_home - pts_away) + linea
-                else:
-                    margen_final = (pts_away - pts_home) + linea
+                margen_final = (pts_home - pts_away) + linea if is_home_pick else (pts_away - pts_home) + linea
                     
-                if margen_final > 0: status = "WON"
-                elif margen_final < 0: status = "LOST"
-                else: status = "PUSH"
+                status = "WON" if margen_final > 0 else "LOST" if margen_final < 0 else "PUSH"
                     
                 with db() as con:
                     con.execute("UPDATE predicciones_zcode SET status=?, puntos_home=?, puntos_away=? WHERE id=?", (status, pts_home, pts_away, pred_id))
-                    
-                print(f"✅ Auditado: {pick} {linea} -> {status} (Final: {pts_home}-{pts_away})")
-    except Exception as e:
-        print(f"Error auditoría: {e}")
+    except Exception: pass
 
 def procesar_mercado():
-    """Esta función corre cada 30 minutos en Render."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Escaneando mercado NBA...")
-    stats = get_nba_stats()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Revisando si hay partidos para analizar...")
+    
+    # 1. Revisar primero ESPN. Si no hay partidos, terminamos (0 créditos gastados).
     try:
         r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games_raw = r.json().get("events", [])
     except Exception:
         return
 
-    for ev in games_raw:
-        # Solo analizamos partidos que no han empezado
-        if ev.get("status", {}).get("type", {}).get("state") != "pre": continue
+    partidos_hoy = [g for g in games_raw if g.get("status", {}).get("type", {}).get("state") == "pre"]
+    
+    if not partidos_hoy:
+        print("💤 No hay partidos sin empezar hoy. No se gastaron créditos en Odds API.")
+        auditar_predicciones()
+        return
 
+    # 2. Como sí hay partidos, gastamos 1 solo crédito para traer TODAS las cuotas de golpe.
+    all_odds = get_all_nba_odds()
+    if not all_odds: return
+
+    stats = get_nba_stats()
+    
+    for ev in partidos_hoy:
         comp = ev.get("competitions", [{}])[0]
         cs = comp.get("competitors", [])
         if len(cs) < 2: continue
@@ -248,7 +265,9 @@ def procesar_mercado():
         proy_away = (a_pf + h_pa) / 2 - 1.25
         margen = proy_home - proy_away
         
-        cuotas = buscar_cuotas_oddsapi(a_name, h_name)
+        # Buscar las cuotas en el diccionario que ya descargamos
+        key = f"{get_team_key(a_name)}_vs_{get_team_key(h_name)}"
+        cuotas = all_odds.get(key)
         
         if cuotas and cuotas.get("spread"):
             home_line, home_odds = cuotas["spread"]["home_line"], cuotas["spread"]["home_odds"]
@@ -260,20 +279,16 @@ def procesar_mercado():
             edge_home = prob_home_spread - (100 / home_odds) if home_odds > 1.0 else -100
             edge_away = prob_away_spread - (100 / away_odds) if away_odds > 1.0 else -100
             
-            if edge_home > 3.0:
-                guardar_prediccion(event_id, f"{a_name} vs {h_name}", h_name, home_line, home_odds, edge_home)
-            elif edge_away > 3.0:
-                guardar_prediccion(event_id, f"{a_name} vs {h_name}", a_name, away_line, away_odds, edge_away)
+            if edge_home > 3.0: guardar_prediccion(event_id, f"{a_name} vs {h_name}", h_name, home_line, home_odds, edge_home)
+            elif edge_away > 3.0: guardar_prediccion(event_id, f"{a_name} vs {h_name}", a_name, away_line, away_odds, edge_away)
                 
-    # Después de buscar valores, actualizamos los resultados viejos
     auditar_predicciones()
 
 # ==========================================
 # RUTAS WEB
 # ==========================================
 @app.get("/")
-def read_root():
-    return {"mensaje": "Bot en segundo plano activo. Ve a /predictor o /historial"}
+def read_root(): return {"mensaje": "Bot optimizado. Ve a /predictor o /historial"}
 
 @app.get("/predictor", response_class=HTMLResponse)
 def predictor_html():
@@ -284,8 +299,10 @@ def predictor_html():
     except Exception:
         return HTMLResponse("<h1>Error cargando partidos</h1>")
 
+    # Descargamos las cuotas 1 sola vez para pintar la pantalla (gasta 1 crédito)
+    all_odds = get_all_nba_odds()
+
     html_cards = ""
-    
     for ev in games_raw:
         comp = ev.get("competitions", [{}])[0]
         cs = comp.get("competitors", [])
@@ -310,7 +327,8 @@ def predictor_html():
         favorito = h_name if prob_home > prob_away else a_name
         prob_fav = prob_home if prob_home > prob_away else prob_away
         
-        cuotas = buscar_cuotas_oddsapi(a_name, h_name)
+        key = f"{get_team_key(a_name)}_vs_{get_team_key(h_name)}"
+        cuotas = all_odds.get(key)
         valor_html = ""
         
         if cuotas and cuotas.get("spread"):
@@ -324,36 +342,13 @@ def predictor_html():
             edge_away = prob_away_spread - (100 / away_odds) if away_odds > 1.0 else -100
             
             if edge_home > 3.0:
-                valor_html = f"""
-                <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
-                    <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
-                    <div class="value-bet">{h_name} {home_line:+.1f} @ {home_odds:.2f}</div>
-                    <div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div>
-                </div>
-                """
+                valor_html = f"""<div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;"><div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div><div class="value-bet">{h_name} {home_line:+.1f} @ {home_odds:.2f}</div><div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div></div>"""
             elif edge_away > 3.0:
-                valor_html = f"""
-                <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
-                    <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
-                    <div class="value-bet">{a_name} {away_line:+.1f} @ {away_odds:.2f}</div>
-                    <div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div>
-                </div>
-                """
+                valor_html = f"""<div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;"><div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div><div class="value-bet">{a_name} {away_line:+.1f} @ {away_odds:.2f}</div><div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div></div>"""
             else:
-                valor_html = f"""
-                <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
-                    <div class="value-title" style="color: #94a3b8;">MERCADO ANALIZADO</div>
-                    <div class="value-bet">{h_name} {home_line:+.1f} ({home_odds:.2f}) | {a_name} {away_line:+.1f} ({away_odds:.2f})</div>
-                    <div class="value-edge" style="color: #94a3b8;">Sin ventaja clara (Edge: {max(edge_home, edge_away):.1f}%)</div>
-                </div>
-                """
+                valor_html = f"""<div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;"><div class="value-title" style="color: #94a3b8;">MERCADO ANALIZADO</div><div class="value-bet">{h_name} {home_line:+.1f} ({home_odds:.2f}) | {a_name} {away_line:+.1f} ({away_odds:.2f})</div><div class="value-edge" style="color: #94a3b8;">Sin ventaja clara (Edge: {max(edge_home, edge_away):.1f}%)</div></div>"""
         else:
-            valor_html = f"""
-            <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
-                <div class="value-title" style="color: #94a3b8;">SIN CUOTAS AÚN</div>
-                <div class="value-bet">Esperando que la casa abra el mercado</div>
-            </div>
-            """
+            valor_html = f"""<div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;"><div class="value-title" style="color: #94a3b8;">SIN CUOTAS AÚN</div><div class="value-bet">Esperando que la casa abra el mercado</div></div>"""
 
         html_cards += f"""
         <div class="card">
@@ -368,43 +363,7 @@ def predictor_html():
         </div>
         """
 
-    html_out = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Zcode Predictor</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: white; padding: 16px; max-width: 500px; margin: auto; }}
-            .card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
-            .card-header {{ display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; font-weight: bold; margin-bottom: 20px; }}
-            .matchup {{ display: flex; justify-content: space-between; align-items: center; text-align: center; }}
-            .team {{ flex: 1; }}
-            .team-name {{ font-size: 14px; font-weight: bold; margin-bottom: 4px; line-height: 1.2; }}
-            .team-prob {{ font-size: 18px; font-weight: bold; color: #eab308; }}
-            .vs {{ flex: 1; padding: 0 10px; }}
-            .gauge {{ width: 100%; height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }}
-            .gauge-fill {{ height: 100%; background: #eab308; }}
-            .fav-text {{ font-size: 10px; color: #94a3b8; text-transform: uppercase; line-height: 1.2; }}
-            .projection {{ display: flex; gap: 10px; margin-top: 20px; border-top: 1px solid #334155; padding: 15px 0 0 0; }}
-            .proj-box {{ flex: 1; text-align: center; }}
-            .proj-label {{ font-size: 10px; color: #94a3b8; font-weight: bold; margin-bottom: 4px; }}
-            .proj-score {{ font-size: 20px; font-weight: bold; color: white; }}
-            .value-box {{ margin-top: 15px; border-radius: 8px; padding: 12px; text-align: center; border: 1px solid transparent; }}
-            .value-title {{ font-size: 12px; font-weight: bold; margin-bottom: 4px; }}
-            .value-bet {{ font-size: 15px; font-weight: bold; color: white; }}
-            .value-edge {{ font-size: 12px; font-weight: bold; margin-top: 4px; }}
-            .nav {{ text-align: center; margin-bottom: 20px; }}
-            .nav a {{ color: #eab308; text-decoration: none; font-weight: bold; margin: 0 10px; }}
-        </style>
-    </head>
-    <body>
-        <div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div>
-        <h2 style="font-size: 18px; margin-bottom: 20px;">ZCODE AI - Predicciones</h2>
-        {html_cards if html_cards else "<p style='text-align:center;'>No hay partidos programados para hoy.</p>"}
-    </body>
-    </html>
-    """
+    html_out = f"""<!DOCTYPE html><html><head><title>Zcode Predictor</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: white; padding: 16px; max-width: 500px; margin: auto; }}.card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}.card-header {{ display: flex; justify-content: space-between; color: #94a3b8; font-size: 12px; font-weight: bold; margin-bottom: 20px; }}.matchup {{ display: flex; justify-content: space-between; align-items: center; text-align: center; }}.team {{ flex: 1; }}.team-name {{ font-size: 14px; font-weight: bold; margin-bottom: 4px; line-height: 1.2; }}.team-prob {{ font-size: 18px; font-weight: bold; color: #eab308; }}.vs {{ flex: 1; padding: 0 10px; }}.gauge {{ width: 100%; height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }}.gauge-fill {{ height: 100%; background: #eab308; }}.fav-text {{ font-size: 10px; color: #94a3b8; text-transform: uppercase; line-height: 1.2; }}.projection {{ display: flex; gap: 10px; margin-top: 20px; border-top: 1px solid #334155; padding: 15px 0 0 0; }}.proj-box {{ flex: 1; text-align: center; }}.proj-label {{ font-size: 10px; color: #94a3b8; font-weight: bold; margin-bottom: 4px; }}.proj-score {{ font-size: 20px; font-weight: bold; color: white; }}.value-box {{ margin-top: 15px; border-radius: 8px; padding: 12px; text-align: center; border: 1px solid transparent; }}.value-title {{ font-size: 12px; font-weight: bold; margin-bottom: 4px; }}.value-bet {{ font-size: 15px; font-weight: bold; color: white; }}.value-edge {{ font-size: 12px; font-weight: bold; margin-top: 4px; }}.nav {{ text-align: center; margin-bottom: 20px; }}.nav a {{ color: #eab308; text-decoration: none; font-weight: bold; margin: 0 10px; }}</style></head><body><div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div><h2 style="font-size: 18px; margin-bottom: 20px;">ZCODE AI - Predicciones</h2>{html_cards if html_cards else "<p style='text-align:center;'>No hay partidos programados para hoy.</p>"}</body></html>"""
     return html_out
 
 @app.get("/historial", response_class=HTMLResponse)
@@ -423,52 +382,9 @@ def historial_html():
         else: color = "#eab308"; bg = "rgba(234, 179, 8, 0.1)"
             
         score_txt = f"{ph} - {pa}" if ph is not None else "-"
-        
-        html_cards += f"""
-        <div class="card" style="border-left: 4px solid {color};">
-            <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                <span style="font-weight:bold;">{partido}</span>
-                <span style="color:{color}; font-weight:bold;">{status}</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:5px;">
-                <span>💡 {pick} {linea:+.1f} @ {cuota:.2f}</span>
-                <span>Edge: +{edge:.1f}%</span>
-            </div>
-            <div style="font-size:12px; color:#94a3b8; text-align:center; margin-top:10px; padding-top:10px; border-top:1px solid #334155;">
-                Marcador Final: {score_txt}
-            </div>
-        </div>
-        """
+        html_cards += f"""<div class="card" style="border-left: 4px solid {color};"><div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span style="font-weight:bold;">{partido}</span><span style="color:{color}; font-weight:bold;">{status}</span></div><div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:5px;"><span>💡 {pick} {linea:+.1f} @ {cuota:.2f}</span><span>Edge: +{edge:.1f}%</span></div><div style="font-size:12px; color:#94a3b8; text-align:center; margin-top:10px; padding-top:10px; border-top:1px solid #334155;">Marcador Final: {score_txt}</div></div>"""
 
-    html_out = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Historial Zcode</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: white; padding: 16px; max-width: 500px; margin: auto; }}
-            .card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 15px; border: 1px solid #334155; }}
-            .nav {{ text-align: center; margin-bottom: 20px; }}
-            .nav a {{ color: #eab308; text-decoration: none; font-weight: bold; margin: 0 10px; }}
-            .stats {{ display:flex; gap:10px; margin-bottom:20px; }}
-            .stat {{ flex:1; background:#1e293b; padding:15px; border-radius:10px; text-align:center; border:1px solid #334155; }}
-            .stat-val {{ font-size:24px; font-weight:bold; }}
-        </style>
-    </head>
-    <body>
-        <div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div>
-        <h2 style="font-size: 18px; margin-bottom: 20px;">Historial de Apuestas</h2>
-        
-        <div class="stats">
-            <div class="stat"><div style="font-size:12px; color:#94a3b8;">GANADAS</div><div class="stat-val" style="color:#10b981;">{won}</div></div>
-            <div class="stat"><div style="font-size:12px; color:#94a3b8;">PERDIDAS</div><div class="stat-val" style="color:#ef4444;">{lost}</div></div>
-        </div>
-
-        {html_cards if html_cards else "<p style='text-align:center;'>No hay apuestas registradas aún.</p>"}
-    </body>
-    </html>
-    """
+    html_out = f"""<!DOCTYPE html><html><head><title>Historial Zcode</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: white; padding: 16px; max-width: 500px; margin: auto; }}.card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 15px; border: 1px solid #334155; }}.nav {{ text-align: center; margin-bottom: 20px; }}.nav a {{ color: #eab308; text-decoration: none; font-weight: bold; margin: 0 10px; }}.stats {{ display:flex; gap:10px; margin-bottom:20px; }}.stat {{ flex:1; background:#1e293b; padding:15px; border-radius:10px; text-align:center; border:1px solid #334155; }}.stat-val {{ font-size:24px; font-weight:bold; }}</style></head><body><div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div><h2 style="font-size: 18px; margin-bottom: 20px;">Historial de Apuestas</h2><div class="stats"><div class="stat"><div style="font-size:12px; color:#94a3b8;">GANADAS</div><div class="stat-val" style="color:#10b981;">{won}</div></div><div class="stat"><div style="font-size:12px; color:#94a3b8;">PERDIDAS</div><div class="stat-val" style="color:#ef4444;">{lost}</div></div></div>{html_cards if html_cards else "<p style='text-align:center;'>No hay apuestas registradas aún.</p>"}</body></html>"""
     return html_out
 
 if __name__ == "__main__":
