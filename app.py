@@ -13,7 +13,7 @@ app = FastAPI()
 # ==========================================
 TURSO_URL     = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
-ODDS_API_KEY  = os.environ.get("ODDS_API_KEY") # <-- Nueva variable
+ODDS_API_KEY  = os.environ.get("ODDS_API_KEY")
 
 # ==========================================
 # CONEXIÓN A TURSO
@@ -85,38 +85,45 @@ def get_nba_stats():
         print(f"Error stats: {e}")
     return stats_dict
 
+# ==========================================
+# NORMALIZADOR DE NOMBRES (ESPN vs ODDS API)
+# ==========================================
 def get_team_key(name):
+    """Convierte cualquier nombre de equipo al formato oficial de 3 letras (Ej: GSW, LAL)."""
     n = name.lower()
-    if "hawks" in n: return "atlanta"
-    if "celtics" in n: return "boston"
-    if "nets" in n: return "brooklyn"
-    if "hornets" in n: return "charlotte"
-    if "bulls" in n: return "chicago"
-    if "cavaliers" in n or "cavs" in n: return "cleveland"
-    if "mavericks" in n or "mavs" in n: return "dallas"
-    if "nuggets" in n: return "denver"
-    if "pistons" in n: return "detroit"
-    if "warriors" in n or "warrior" in n or "gsw" in n: return "goldenstate"
-    if "rockets" in n: return "houston"
-    if "pacers" in n: return "indiana"
-    if "clippers" in n or "lac" in n: return "clippers"
-    if "lakers" in n or "lal" in n: return "lakers"
-    if "grizzlies" in n: return "memphis"
-    if "heat" in n: return "miami"
-    if "bucks" in n: return "milwaukee"
-    if "timberwolves" in n or "wolves" in n or "min" in n: return "minnesota"
-    if "pelicans" in n or "nop" in n: return "neworleans"
-    if "knicks" in n or "nyk" in n: return "newyork"
-    if "thunder" in n or "okc" in n: return "oklahomacity"
-    if "magic" in n or "orl" in n: return "orlando"
-    if "76ers" in n or "sixers" in n or "phi" in n: return "philadelphia"
-    if "suns" in n or "pho" in n: return "phoenix"
-    if "blazers" in n or "trail blazers" in n or "por" in n: return "portland"
-    if "kings" in n or "sac" in n: return "sacramento"
-    if "spurs" in n or "sas" in n: return "sanantonio"
-    if "raptors" in n or "tor" in n: return "toronto"
-    if "jazz" in n or "uta" in n: return "utah"
-    if "wizards" in n or "was" in n: return "washington"
+    
+    # Mapeo exhaustivo de nombres comunes y abreviaturas
+    if "hawks" in n or "atl" in n: return "ATL"
+    if "celtics" in n or "bos" in n: return "BOS"
+    if "nets" in n or "bkn" in n: return "BKN"
+    if "hornets" in n or "cha" in n: return "CHA"
+    if "bulls" in n or "chi" in n: return "CHI"
+    if "cavaliers" in n or "cavs" in n or "cle" in n: return "CLE"
+    if "mavericks" in n or "mavs" in n or "dal" in n: return "DAL"
+    if "nuggets" in n or "den" in n: return "DEN"
+    if "pistons" in n or "det" in n: return "DET"
+    if "warriors" in n or "gsw" in n or "golden state" in n: return "GSW"
+    if "rockets" in n or "hou" in n: return "HOU"
+    if "pacers" in n or "ind" in n: return "IND"
+    if "clippers" in n or "lac" in n: return "LAC"
+    if "lakers" in n or "lal" in n: return "LAL"
+    if "grizzlies" in n or "mem" in n: return "MEM"
+    if "heat" in n or "mia" in n: return "MIA"
+    if "bucks" in n or "mil" in n: return "MIL"
+    if "timberwolves" in n or "wolves" in n or "min" in n: return "MIN"
+    if "pelicans" in n or "nop" in n: return "NOP"
+    if "knicks" in n or "nyk" in n: return "NYK"
+    if "thunder" in n or "okc" in n: return "OKC"
+    if "magic" in n or "orl" in n: return "ORL"
+    if "76ers" in n or "sixers" in n or "phi" in n: return "PHI"
+    if "suns" in n or "phx" in n or "pho" in n: return "PHX"
+    if "blazers" in n or "trail blazers" in n or "por" in n: return "POR"
+    if "kings" in n or "sac" in n: return "SAC"
+    if "spurs" in n or "sas" in n: return "SAS"
+    if "raptors" in n or "tor" in n: return "TOR"
+    if "jazz" in n or "uta" in n: return "UTA"
+    if "wizards" in n or "was" in n: return "WAS"
+    
     return n
 
 # ==========================================
@@ -125,12 +132,11 @@ def get_team_key(name):
 def buscar_cuotas_oddsapi(away_name, home_name):
     if not ODDS_API_KEY: return None
     
-    # Endpoint de The Odds API para NBA
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "us",
-        "markets": "spreads,h2h", # Spreads (Hándicap) y H2H (Moneyline)
+        "markets": "spreads,h2h",
         "oddsFormat": "decimal"
     }
     
@@ -142,58 +148,46 @@ def buscar_cuotas_oddsapi(away_name, home_name):
             
         games = r.json()
         
-        # Buscar el partido que coincida con los nombres
         for game in games:
             h_api = game.get("home_team", "")
             a_api = game.get("away_team", "")
             
-            # Comparamos usando las llaves para evitar problemas con nombres completos
+            # Ahora comparamos las llaves (ATL, GSW, etc.) en lugar de los nombres completos
             if get_team_key(h_api) == get_team_key(home_name) and get_team_key(a_api) == get_team_key(away_name):
                 
                 bookmakers = game.get("bookmakers", [])
-                if not bookmakers:
-                    return None
+                if not bookmakers: return None
                 
-                # Tomamos la primera casa de apuestas disponible (usualmente DraftKings o FanDuel)
-                book = bookmakers[0]
+                book = bookmakers[0] # Tomamos la primera casa (DraftKings, FanDuel, etc.)
                 markets = book.get("markets", [])
                 
                 cuotas = {"spread": None, "moneyline": None}
                 
                 for market in markets:
                     if market.get("key") == "spreads":
-                        outcomes = market.get("outcomes", [])
-                        # The Odds API devuelve los outcomes con el nombre del equipo
-                        for out in outcomes:
+                        spread_data = {}
+                        for out in market.get("outcomes", []):
                             if get_team_key(out.get("name", "")) == get_team_key(home_name):
-                                cuotas["spread"] = {
-                                    "line": float(out.get("point", 0)),
-                                    "home_odds": float(out.get("price", 0))
-                                }
+                                spread_data["home_line"] = float(out.get("point", 0))
+                                spread_data["home_odds"] = float(out.get("price", 0))
                             elif get_team_key(out.get("name", "")) == get_team_key(away_name):
-                                if cuotas["spread"] is None:
-                                    cuotas["spread"] = {}
-                                cuotas["spread"]["line"] = float(out.get("point", 0))
-                                cuotas["spread"]["away_odds"] = float(out.get("price", 0))
-                                
+                                spread_data["away_line"] = float(out.get("point", 0))
+                                spread_data["away_odds"] = float(out.get("price", 0))
+                        
+                        if len(spread_data) == 4: 
+                            cuotas["spread"] = spread_data
+                            
                     elif market.get("key") == "h2h":
-                        outcomes = market.get("outcomes", [])
-                        for out in outcomes:
+                        m_data = {}
+                        for out in market.get("outcomes", []):
                             if get_team_key(out.get("name", "")) == get_team_key(home_name):
-                                cuotas["moneyline"] = {"home_odds": float(out.get("price", 0))}
+                                m_data["home_odds"] = float(out.get("price", 0))
                             elif get_team_key(out.get("name", "")) == get_team_key(away_name):
-                                if cuotas["moneyline"] is None:
-                                    cuotas["moneyline"] = {}
-                                cuotas["moneyline"]["away_odds"] = float(out.get("price", 0))
+                                m_data["away_odds"] = float(out.get("price", 0))
+                        if len(m_data) == 2:
+                            cuotas["moneyline"] = m_data
                 
-                # Aseguramos que el spread tenga ambas cuotas
-                if cuotas["spread"] and "home_odds" in cuotas["spread"] and "away_odds" in cuotas["spread"]:
-                    return cuotas
-                elif cuotas["moneyline"]:
-                    # Si no hay spread pero sí moneyline, lo devolvemos (podríamos adaptarlo)
-                    pass
-                
-                return None # Si el partido existe pero no tiene los mercados completos
+                return cuotas if (cuotas["spread"] or cuotas["moneyline"]) else None
                 
     except Exception as e:
         print(f"Error cuotas OddsAPI: {e}")
@@ -250,19 +244,20 @@ def predictor_html():
         favorito = h_name if prob_home > prob_away else a_name
         prob_fav = prob_home if prob_home > prob_away else prob_away
         
-        # 2. Buscar cuotas reales en The Odds API
+        # 2. Buscar cuotas reales
         cuotas = buscar_cuotas_oddsapi(a_name, h_name)
         
         # 3. Evaluar si hay Valor (Edge)
         valor_html = ""
         if cuotas and cuotas.get("spread"):
-            spread_line = cuotas["spread"].get("line", 0)
-            home_odds = cuotas["spread"].get("home_odds", 0)
-            away_odds = cuotas["spread"].get("away_odds", 0)
+            home_line = cuotas["spread"]["home_line"]
+            home_odds = cuotas["spread"]["home_odds"]
+            away_line = cuotas["spread"]["away_line"]
+            away_odds = cuotas["spread"]["away_odds"]
             
             # Probabilidad real de cubrir el spread
-            prob_home_spread = normal_cdf((margen - spread_line) / 11.5) * 100
-            prob_away_spread = 100 - prob_home_spread
+            prob_home_spread = normal_cdf((margen - home_line) / 11.5) * 100
+            prob_away_spread = normal_cdf((-margen - away_line) / 11.5) * 100
             
             # Calcular Edge (Valor) vs Casa
             edge_home = prob_home_spread - (100 / home_odds) if home_odds > 1.0 else -100
@@ -272,7 +267,7 @@ def predictor_html():
                 valor_html = f"""
                 <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
                     <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
-                    <div class="value-bet">{h_name} {spread_line:+.1f} @ {home_odds:.2f}</div>
+                    <div class="value-bet">{h_name} {home_line:+.1f} @ {home_odds:.2f}</div>
                     <div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div>
                 </div>
                 """
@@ -280,7 +275,7 @@ def predictor_html():
                 valor_html = f"""
                 <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
                     <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
-                    <div class="value-bet">{a_name} {-spread_line:+.1f} @ {away_odds:.2f}</div>
+                    <div class="value-bet">{a_name} {away_line:+.1f} @ {away_odds:.2f}</div>
                     <div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div>
                 </div>
                 """
@@ -288,7 +283,7 @@ def predictor_html():
                 valor_html = f"""
                 <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
                     <div class="value-title" style="color: #94a3b8;">MERCADO ANALIZADO</div>
-                    <div class="value-bet">Línea: {spread_line:+.1f} | Cuotas: {home_odds:.2f} / {away_odds:.2f}</div>
+                    <div class="value-bet">{h_name} {home_line:+.1f} ({home_odds:.2f}) | {a_name} {away_line:+.1f} ({away_odds:.2f})</div>
                     <div class="value-edge" style="color: #94a3b8;">Sin ventaja clara (Edge: {max(edge_home, edge_away):.1f}%)</div>
                 </div>
                 """
@@ -362,9 +357,9 @@ def predictor_html():
             .proj-score {{ font-size: 20px; font-weight: bold; color: white; }}
             
             /* Estilos para el cuadro de Valor */
-            .value-box {{ margin-top: 15px; border-radius: 8px; padding: 12px; text-align: center; }}
+            .value-box {{ margin-top: 15px; border-radius: 8px; padding: 12px; text-align: center; border: 1px solid transparent; }}
             .value-title {{ font-size: 12px; font-weight: bold; margin-bottom: 4px; }}
-            .value-bet {{ font-size: 16px; font-weight: bold; color: white; }}
+            .value-bet {{ font-size: 15px; font-weight: bold; color: white; }}
             .value-edge {{ font-size: 12px; font-weight: bold; margin-top: 4px; }}
         </style>
     </head>
