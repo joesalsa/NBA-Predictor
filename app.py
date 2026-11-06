@@ -13,7 +13,7 @@ app = FastAPI()
 # ==========================================
 TURSO_URL     = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
-INFER_API_KEY = os.environ.get("INFER_API_KEY")
+ODDS_API_KEY  = os.environ.get("ODDS_API_KEY") # <-- Nueva variable
 
 # ==========================================
 # CONEXIÓN A TURSO
@@ -119,43 +119,85 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "washington"
     return n
 
-def buscar_cuotas_infersports(away_name, home_name):
-    if not INFER_API_KEY: return None
-    headers = {"Authorization": f"Bearer {INFER_API_KEY}"}
+# ==========================================
+# BUSCAR CUOTAS EN THE ODDS API
+# ==========================================
+def buscar_cuotas_oddsapi(away_name, home_name):
+    if not ODDS_API_KEY: return None
+    
+    # Endpoint de The Odds API para NBA
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "us",
+        "markets": "spreads,h2h", # Spreads (Hándicap) y H2H (Moneyline)
+        "oddsFormat": "decimal"
+    }
+    
     try:
-        r = requests.get("https://api.infersports.dev/v1/events", headers=headers, params={"sport": "basketball", "league": "NBA"}, timeout=10)
-        if r.status_code != 200: return None
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200: 
+            print(f"Error OddsAPI: {r.status_code} - {r.text}")
+            return None
+            
+        games = r.json()
         
-        event_id = None
-        for ev in r.json().get("data", []):
-            h = ev.get("home_team", {}).get("name", "")
-            a = ev.get("away_team", {}).get("name", "")
-            if get_team_key(h) == get_team_key(home_name) and get_team_key(a) == get_team_key(away_name):
-                event_id = ev['id']
-                break
+        # Buscar el partido que coincida con los nombres
+        for game in games:
+            h_api = game.get("home_team", "")
+            a_api = game.get("away_team", "")
+            
+            # Comparamos usando las llaves para evitar problemas con nombres completos
+            if get_team_key(h_api) == get_team_key(home_name) and get_team_key(a_api) == get_team_key(away_name):
                 
-        if not event_id: return None
-        
-        r2 = requests.get(f"https://api.infersports.dev/v1/events/{event_id}/odds?format=decimal", headers=headers, timeout=10)
-        if r2.status_code != 200: return None
-        
-        cuotas = {"spread": None, "moneyline": None}
-        for odd in r2.json().get("odds", []):
-            if odd.get("market_type") == "spread" and odd.get("period") == "full_time" and odd.get("status") == "open":
-                cuotas["spread"] = {
-                    "line": float(odd.get("line")), 
-                    "home_odds": float(odd.get("prices", {}).get("home", 0)),
-                    "away_odds": float(odd.get("prices", {}).get("away", 0))
-                }
-            elif odd.get("market_type") == "moneyline" and odd.get("period") == "full_time" and odd.get("status") == "open":
-                cuotas["moneyline"] = {
-                    "home_odds": float(odd.get("prices", {}).get("home", 0)),
-                    "away_odds": float(odd.get("prices", {}).get("away", 0))
-                }
-        return cuotas
+                bookmakers = game.get("bookmakers", [])
+                if not bookmakers:
+                    return None
+                
+                # Tomamos la primera casa de apuestas disponible (usualmente DraftKings o FanDuel)
+                book = bookmakers[0]
+                markets = book.get("markets", [])
+                
+                cuotas = {"spread": None, "moneyline": None}
+                
+                for market in markets:
+                    if market.get("key") == "spreads":
+                        outcomes = market.get("outcomes", [])
+                        # The Odds API devuelve los outcomes con el nombre del equipo
+                        for out in outcomes:
+                            if get_team_key(out.get("name", "")) == get_team_key(home_name):
+                                cuotas["spread"] = {
+                                    "line": float(out.get("point", 0)),
+                                    "home_odds": float(out.get("price", 0))
+                                }
+                            elif get_team_key(out.get("name", "")) == get_team_key(away_name):
+                                if cuotas["spread"] is None:
+                                    cuotas["spread"] = {}
+                                cuotas["spread"]["line"] = float(out.get("point", 0))
+                                cuotas["spread"]["away_odds"] = float(out.get("price", 0))
+                                
+                    elif market.get("key") == "h2h":
+                        outcomes = market.get("outcomes", [])
+                        for out in outcomes:
+                            if get_team_key(out.get("name", "")) == get_team_key(home_name):
+                                cuotas["moneyline"] = {"home_odds": float(out.get("price", 0))}
+                            elif get_team_key(out.get("name", "")) == get_team_key(away_name):
+                                if cuotas["moneyline"] is None:
+                                    cuotas["moneyline"] = {}
+                                cuotas["moneyline"]["away_odds"] = float(out.get("price", 0))
+                
+                # Aseguramos que el spread tenga ambas cuotas
+                if cuotas["spread"] and "home_odds" in cuotas["spread"] and "away_odds" in cuotas["spread"]:
+                    return cuotas
+                elif cuotas["moneyline"]:
+                    # Si no hay spread pero sí moneyline, lo devolvemos (podríamos adaptarlo)
+                    pass
+                
+                return None # Si el partido existe pero no tiene los mercados completos
+                
     except Exception as e:
-        print(f"Error cuotas: {e}")
-        return None
+        print(f"Error cuotas OddsAPI: {e}")
+    return None
 
 # ==========================================
 # RUTAS
@@ -208,40 +250,55 @@ def predictor_html():
         favorito = h_name if prob_home > prob_away else a_name
         prob_fav = prob_home if prob_home > prob_away else prob_away
         
-        # 2. Buscar cuotas reales
-        cuotas = buscar_cuotas_infersports(a_name, h_name)
+        # 2. Buscar cuotas reales en The Odds API
+        cuotas = buscar_cuotas_oddsapi(a_name, h_name)
         
         # 3. Evaluar si hay Valor (Edge)
         valor_html = ""
-        if cuotas and cuotas["spread"]:
-            spread_line = cuotas["spread"]["line"]
-            home_odds = cuotas["spread"]["home_odds"]
-            away_odds = cuotas["spread"]["away_odds"]
+        if cuotas and cuotas.get("spread"):
+            spread_line = cuotas["spread"].get("line", 0)
+            home_odds = cuotas["spread"].get("home_odds", 0)
+            away_odds = cuotas["spread"].get("away_odds", 0)
             
             # Probabilidad real de cubrir el spread
             prob_home_spread = normal_cdf((margen - spread_line) / 11.5) * 100
             prob_away_spread = 100 - prob_home_spread
             
             # Calcular Edge (Valor) vs Casa
-            edge_home = prob_home_spread - (100 / home_odds) if home_odds > 0 else -100
-            edge_away = prob_away_spread - (100 / away_odds) if away_odds > 0 else -100
+            edge_home = prob_home_spread - (100 / home_odds) if home_odds > 1.0 else -100
+            edge_away = prob_away_spread - (100 / away_odds) if away_odds > 1.0 else -100
             
             if edge_home > 3.0:
                 valor_html = f"""
-                <div class="value-box">
-                    <div class="value-title">💎 VALOR DETECTADO</div>
+                <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
+                    <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
                     <div class="value-bet">{h_name} {spread_line:+.1f} @ {home_odds:.2f}</div>
-                    <div class="value-edge">Edge: +{edge_home:.1f}%</div>
+                    <div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div>
                 </div>
                 """
             elif edge_away > 3.0:
                 valor_html = f"""
-                <div class="value-box">
-                    <div class="value-title">💎 VALOR DETECTADO</div>
+                <div class="value-box" style="background: rgba(16, 185, 129, 0.1); border-color: #10b981;">
+                    <div class="value-title" style="color: #10b981;">💎 VALOR DETECTADO</div>
                     <div class="value-bet">{a_name} {-spread_line:+.1f} @ {away_odds:.2f}</div>
-                    <div class="value-edge">Edge: +{edge_away:.1f}%</div>
+                    <div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div>
                 </div>
                 """
+            else:
+                valor_html = f"""
+                <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
+                    <div class="value-title" style="color: #94a3b8;">MERCADO ANALIZADO</div>
+                    <div class="value-bet">Línea: {spread_line:+.1f} | Cuotas: {home_odds:.2f} / {away_odds:.2f}</div>
+                    <div class="value-edge" style="color: #94a3b8;">Sin ventaja clara (Edge: {max(edge_home, edge_away):.1f}%)</div>
+                </div>
+                """
+        else:
+            valor_html = f"""
+            <div class="value-box" style="background: rgba(148, 163, 184, 0.1); border-color: #94a3b8;">
+                <div class="value-title" style="color: #94a3b8;">SIN CUOTAS AÚN</div>
+                <div class="value-bet">Esperando que la casa abra el mercado</div>
+            </div>
+            """
 
         # 4. Imprimir tarjeta
         html_cards += f"""
@@ -305,10 +362,10 @@ def predictor_html():
             .proj-score {{ font-size: 20px; font-weight: bold; color: white; }}
             
             /* Estilos para el cuadro de Valor */
-            .value-box {{ margin-top: 15px; background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; border-radius: 8px; padding: 12px; text-align: center; }}
-            .value-title {{ color: #10b981; font-size: 12px; font-weight: bold; margin-bottom: 4px; }}
+            .value-box {{ margin-top: 15px; border-radius: 8px; padding: 12px; text-align: center; }}
+            .value-title {{ font-size: 12px; font-weight: bold; margin-bottom: 4px; }}
             .value-bet {{ font-size: 16px; font-weight: bold; color: white; }}
-            .value-edge {{ font-size: 12px; color: #10b981; font-weight: bold; margin-top: 4px; }}
+            .value-edge {{ font-size: 12px; font-weight: bold; margin-top: 4px; }}
         </style>
     </head>
     <body>
