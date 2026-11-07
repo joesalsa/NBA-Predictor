@@ -711,3 +711,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     # En producción usar: uvicorn app:app --host 0.0.0.0 --port $PORT
     uvicorn.run("app:app", host="0.0.0.0", port=port)
+
+@app.get("/health")
+@app.head("/health")
+def health_check():
+    return {"status": "ok"}
