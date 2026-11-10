@@ -111,37 +111,45 @@ def init_db():
 init_db()
 
 # ==========================================
-# MATEMÁTICA (POISSON)
+# MATEMÁTICA (POISSON CORREGIDO)
 # ==========================================
-def poisson_pmf(k, lam):
-    if lam <= 0: return 1.0 if k == 0 else 0.0
-    return (math.exp(-lam) * (lam**k)) / math.factorial(k)
+def generar_poisson_pmf(lam, max_puntos=250):
+    """Genera la lista de probabilidades de Poisson de forma iterativa para evitar Overflow."""
+    if lam <= 0:
+        return [1.0] + [0.0] * (max_puntos - 1)
+    
+    probs = []
+    p = math.exp(-lam)
+    probs.append(p)
+    
+    for k in range(1, max_puntos):
+        p = p * lam / k
+        probs.append(p)
+    return probs
 
 def calcular_probabilidades_poisson(proj_home, proj_away, spread_line, total_line):
-    """
-    Calcula las probabilidades usando Distribución de Poisson.
-    Retorna: (prob_home_gana, prob_away_gana, prob_spread_home, prob_spread_away, prob_over, prob_under)
-    """
-    max_puntos = 250 # Límite seguro para iterar
+    max_puntos = 250
     prob_home_gana, prob_away_gana = 0.0, 0.0
     prob_spread_home, prob_spread_away = 0.0, 0.0
     prob_over, prob_under = 0.0, 0.0
 
-    # Poisson para la suma total de puntos (O/U)
+    # 1. Poisson para la suma total de puntos (O/U)
     total_lambda = proj_home + proj_away
+    p_total_vals = generar_poisson_pmf(total_lambda, max_puntos)
+    
     for total_pts in range(max_puntos):
-        p_total = poisson_pmf(total_pts, total_lambda)
-        if total_pts > total_line: prob_over += p_total
-        else: prob_under += p_total
+        if total_pts > total_line: prob_over += p_total_vals[total_pts]
+        else: prob_under += p_total_vals[total_pts]
 
-    # Poisson bivariado para el margen (Ganador y Spread)
+    # 2. Poisson bivariado para el margen (Ganador y Spread)
+    p_h_vals = generar_poisson_pmf(proj_home, max_puntos)
+    p_a_vals = generar_poisson_pmf(proj_away, max_puntos)
+
     for h_pts in range(max_puntos):
-        p_h = poisson_pmf(h_pts, proj_home)
-        if p_h < 1e-8: continue
+        if p_h_vals[h_pts] < 1e-10: continue
         for a_pts in range(max_puntos):
-            p_a = poisson_pmf(a_pts, proj_away)
-            if p_a < 1e-8: continue
-            prob = p_h * p_a
+            if p_a_vals[a_pts] < 1e-10: continue
+            prob = p_h_vals[h_pts] * p_a_vals[a_pts]
 
             # Quién gana
             if h_pts > a_pts: prob_home_gana += prob
@@ -166,7 +174,6 @@ def implied_fair_pcts(odds_a, odds_b):
 def get_advanced_stats():
     """Calcula promedios de temporada, local/visita, últimos 5 y media de liga."""
     try:
-        # 1. Obtener todos los equipos
         r_teams = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams", timeout=15)
         teams = r_teams.json().get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
         
@@ -178,14 +185,12 @@ def get_advanced_stats():
             team_id = t["team"]["id"]
             team_name = norm(t["team"]["displayName"])
             
-            # Inicializar contadores
             pf_gen, pa_gen, gp_gen = 0, 0, 0
             pf_loc, pa_loc, gp_loc = 0, 0, 0
             pf_vis, pa_vis, gp_vis = 0, 0, 0
             last5_pf, last5_pa, last5_gp = 0, 0, 0
             recent_games = []
 
-            # Obtener calendario
             r_sched = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule", timeout=15)
             events = r_sched.json().get("events", [])
 
@@ -205,47 +210,32 @@ def get_advanced_stats():
                     else:
                         opp_pts = score
 
-                # Guardar para liga
                 if game_id not in processed_games:
-                    if is_home:
-                        total_home_pts += team_pts
-                    else:
-                        total_away_pts += team_pts
+                    if is_home: total_home_pts += team_pts
+                    else: total_away_pts += team_pts
                     total_games += 1
                     processed_games.add(game_id)
 
-                # Acumular para el equipo
                 pf_gen += team_pts
                 pa_gen += opp_pts
                 gp_gen += 1
 
                 if is_home:
-                    pf_loc += team_pts
-                    pa_loc += opp_pts
-                    gp_loc += 1
+                    pf_loc += team_pts; pa_loc += opp_pts; gp_loc += 1
                 else:
-                    pf_vis += team_pts
-                    pa_vis += opp_pts
-                    gp_vis += 1
+                    pf_vis += team_pts; pa_vis += opp_pts; gp_vis += 1
 
                 recent_games.append({"pf": team_pts, "pa": opp_pts})
 
-            # Calcular Últimos 5
             for g in recent_games[-5:]:
-                last5_pf += g["pf"]
-                last5_pa += g["pa"]
-                last5_gp += 1
+                last5_pf += g["pf"]; last5_pa += g["pa"]; last5_gp += 1
 
             stats_dict[team_name] = {
                 "id": team_id,
-                "pf_gen": pf_gen / max(1, gp_gen),
-                "pa_gen": pa_gen / max(1, gp_gen),
-                "pf_loc": pf_loc / max(1, gp_loc),
-                "pa_loc": pa_loc / max(1, gp_loc),
-                "pf_vis": pf_vis / max(1, gp_vis),
-                "pa_vis": pa_vis / max(1, gp_vis),
-                "pf_l5": last5_pf / max(1, last5_gp),
-                "pa_l5": last5_pa / max(1, last5_gp),
+                "pf_gen": pf_gen / max(1, gp_gen), "pa_gen": pa_gen / max(1, gp_gen),
+                "pf_loc": pf_loc / max(1, gp_loc), "pa_loc": pa_loc / max(1, gp_loc),
+                "pf_vis": pf_vis / max(1, gp_vis), "pa_vis": pa_vis / max(1, gp_vis),
+                "pf_l5": last5_pf / max(1, last5_gp), "pa_l5": last5_pa / max(1, last5_gp),
             }
 
         liga_home_avg = total_home_pts / max(1, total_games / 2)
@@ -280,7 +270,6 @@ def get_injury_penalty(team_id, injuries_global):
         athlete = inj.get("athlete", {}).get("displayName", "")
         short = athlete.split()[-1] if athlete else ""
         
-        # Aproximación básica (asumimos que los 3 primeros de la lista son titulares)
         if status in ("Out", "Doubtful"):
             penalty -= 2.5
             txt += f"❌ {short} "
@@ -383,7 +372,6 @@ def auditar_predicciones():
             pts_home = int(home.get("score", 0))
             pts_away = int(away.get("score", 0))
             
-            # Lógica de resolución para Spread y O/U
             status = "LOST"
             if "OVER" in pick or "UNDER" in pick:
                 total_final = pts_home + pts_away
@@ -448,7 +436,6 @@ def _procesar_mercado_inner():
         pen_home, _ = get_injury_penalty(h["id"], injuries_global)
         pen_away, _ = get_injury_penalty(a["id"], injuries_global)
 
-        # Fórmula Triple Media
         ataque_local = (h["pf_gen"] + h["pf_loc"] + h["pf_l5"]) / 3
         defensa_visita = (a["pa_gen"] + a["pa_vis"] + a["pa_l5"]) / 3
         proy_home = (ataque_local + defensa_visita + liga_home) / 3 + pen_home
@@ -464,7 +451,6 @@ def _procesar_mercado_inner():
         spread_data = cuotas.get("spread")
         total_data = cuotas.get("total")
 
-        # Calcular Poisson
         spread_h = spread_data["home_line"] if spread_data else 0
         spread_a = spread_data["away_line"] if spread_data else 0
         total_l = total_data["line"] if total_data else 220
@@ -473,7 +459,6 @@ def _procesar_mercado_inner():
             proy_home, proy_away, spread_h, total_l
         )
 
-        # Evaluar Spread
         if spread_data:
             fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
             edge_h = (p_h_spread * 100) - fair_h
@@ -484,7 +469,6 @@ def _procesar_mercado_inner():
             elif edge_a > EDGE_MIN:
                 guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", a_name.title(), spread_a, spread_data["away_odds"], edge_a)
 
-        # Evaluar Over/Under
         if total_data:
             fair_o, fair_u = implied_fair_pcts(total_data["over_odds"], total_data["under_odds"])
             edge_o = (p_over * 100) - fair_o
@@ -538,7 +522,6 @@ def predictor_html():
         pen_home, txt_home = get_injury_penalty(h["id"], injuries_global)
         pen_away, txt_away = get_injury_penalty(a["id"], injuries_global)
 
-        # Fórmula Triple Media
         ataque_local = (h["pf_gen"] + h["pf_loc"] + h["pf_l5"]) / 3
         defensa_visita = (a["pa_gen"] + a["pa_vis"] + a["pa_l5"]) / 3
         proy_home = (ataque_local + defensa_visita + liga_home) / 3 + pen_home
@@ -555,7 +538,6 @@ def predictor_html():
             spread_data = cuotas.get("spread")
             total_data = cuotas.get("total")
             
-            # Probabilidades Poisson (calculadas con línea pregame o default)
             spread_h = spread_data["home_line"] if spread_data else 0
             spread_a = spread_data["away_line"] if spread_data else 0
             total_l = total_data["line"] if total_data else 220
@@ -567,7 +549,6 @@ def predictor_html():
             prob_home = p_h_win * 100
             prob_away = p_a_win * 100
 
-            # Mostrar valor en Spread
             if spread_data:
                 fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
                 edge_h = (p_h_spread * 100) - fair_h
@@ -584,7 +565,6 @@ def predictor_html():
                                   f'<div class="value-bet">{escape(a_name.title())} {spread_a:+.1f} @ {spread_data["away_odds"]:.2f}</div>'
                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_a:.1f}%</div></div>')
             
-            # Mostrar valor en Over/Under (Si es mayor al 3%)
             if total_data:
                 fair_o, fair_u = implied_fair_pcts(total_data["over_odds"], total_data["under_odds"])
                 edge_o = (p_over * 100) - fair_o
@@ -612,7 +592,6 @@ def predictor_html():
                           f'<div class="value-title" style="color: #94a3b8;">SIN CUOTAS</div>'
                           f'<div class="value-bet">1xBet no ha abierto el mercado</div></div>')
 
-        # Total Proyectado y Regla O/U
         total_proyectado = proy_home + proy_away
         if total_data:
             linea_pre = total_data["line"]
