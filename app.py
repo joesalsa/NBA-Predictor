@@ -1,5 +1,5 @@
 # ==========================================
-# ALLBETS — Value Betting Bot (1xBet + Lesiones)
+# ALLBETS — Value Betting Bot (Triple Media + Poisson)
 # ==========================================
 import math
 import os
@@ -21,52 +21,25 @@ TURSO_TOKEN  = os.environ.get("TURSO_AUTH_TOKEN")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 
 # ==========================================
-# CONFIG
+# CONFIGURACIÓN
 # ==========================================
-SIGMA                = 13.5   # desviación estándar del margen (más honesta que 11.5)
 EDGE_MIN             = 3.0    # % mínimo para señal
-CACHE_STATS_TTL      = 3600   # 1 h
+CACHE_STATS_TTL      = 86400  # 24 h (Caché de estadísticas avanzadas)
 CACHE_ODDS_TTL       = 300    # 5 min
 CACHE_INJURIES_TTL   = 1800   # 30 min
-CACHE_DEPTH_TTL      = 86400  # 24 h
-PENDING_TIMEOUT_DAYS = 3      # PENDING > N días → VOID
+PENDING_TIMEOUT_DAYS = 3
 
-# ==========================================
-# MAPEO DE EQUIPOS (exact match, evita colisiones tipo "nets" in "hornets")
-# ==========================================
 TEAM_KEYS = {
-    "atlanta hawks": "ATL",
-    "boston celtics": "BOS",
-    "brooklyn nets": "BKN",
-    "charlotte hornets": "CHA",
-    "chicago bulls": "CHI",
-    "cleveland cavaliers": "CLE",
-    "dallas mavericks": "DAL",
-    "denver nuggets": "DEN",
-    "detroit pistons": "DET",
-    "golden state warriors": "GSW",
-    "houston rockets": "HOU",
-    "indiana pacers": "IND",
-    "la clippers": "LAC",
-    "los angeles clippers": "LAC",
-    "la lakers": "LAL",
-    "los angeles lakers": "LAL",
-    "memphis grizzlies": "MEM",
-    "miami heat": "MIA",
-    "milwaukee bucks": "MIL",
-    "minnesota timberwolves": "MIN",
-    "new orleans pelicans": "NOP",
-    "new york knicks": "NY",
-    "oklahoma city thunder": "OKC",
-    "orlando magic": "ORL",
-    "philadelphia 76ers": "PHI",
-    "phoenix suns": "PHX",
-    "portland trail blazers": "POR",
-    "sacramento kings": "SAC",
-    "san antonio spurs": "SAS",
-    "toronto raptors": "TOR",
-    "utah jazz": "UTA",
-    "washington wizards": "WAS",
+    "atlanta hawks": "ATL", "boston celtics": "BOS", "brooklyn nets": "BKN",
+    "charlotte hornets": "CHA", "chicago bulls": "CHI", "cleveland cavaliers": "CLE",
+    "dallas mavericks": "DAL", "denver nuggets": "DEN", "detroit pistons": "DET",
+    "golden state warriors": "GSW", "houston rockets": "HOU", "indiana pacers": "IND",
+    "la clippers": "LAC", "los angeles clippers": "LAC", "la lakers": "LAL", "los angeles lakers": "LAL",
+    "memphis grizzlies": "MEM", "miami heat": "MIA", "milwaukee bucks": "MIL",
+    "minnesota timberwolves": "MIN", "new orleans pelicans": "NOP", "new york knicks": "NY",
+    "oklahoma city thunder": "OKC", "orlando magic": "ORL", "philadelphia 76ers": "PHI",
+    "phoenix suns": "PHX", "portland trail blazers": "POR", "sacramento kings": "SAC",
+    "san antonio spurs": "SAS", "toronto raptors": "TOR", "utah jazz": "UTA", "washington wizards": "WAS",
 }
 
 def get_team_key(name):
@@ -76,7 +49,7 @@ def norm(name):
     return str(name).strip().lower()
 
 # ==========================================
-# CACHÉ GENÉRICO
+# CACHÉ
 # ==========================================
 _CACHE = {}
 
@@ -89,18 +62,6 @@ def _cached(key, ttl_sec, fn):
     _CACHE[key] = {"t": now, "v": v}
     return v
 
-# Caché específico de depth charts (por equipo)
-_DEPTH_CACHE = {}
-
-def get_depth_cached(team_id):
-    now = _time.time()
-    entry = _DEPTH_CACHE.get(str(team_id))
-    if entry and now - entry[0] < CACHE_DEPTH_TTL:
-        return entry[1]
-    starters = _fetch_depth(team_id)
-    _DEPTH_CACHE[str(team_id)] = (now, starters)
-    return starters
-
 # ==========================================
 # SCHEDULER Y LIFESPAN
 # ==========================================
@@ -108,10 +69,7 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(
-        procesar_mercado, "interval", minutes=60,
-        id="allbets_job", coalesce=True, max_instances=1,
-    )
+    scheduler.add_job(procesar_mercado, "interval", minutes=60, id="allbets_job", coalesce=True, max_instances=1)
     scheduler.start()
     print("🚀 Scheduler iniciado: buscando valor en 1xBet cada 60 minutos.")
     yield
@@ -132,219 +90,266 @@ def db():
         con.close()
 
 def init_db():
-    for attempt in range(3):
-        try:
-            with db() as con:
-                con.executescript("""
-                    CREATE TABLE IF NOT EXISTS predicciones_allbets (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        event_id TEXT,
-                        fecha TEXT,
-                        partido TEXT,
-                        pick TEXT,
-                        linea REAL,
-                        cuota REAL,
-                        edge REAL,
-                        status TEXT DEFAULT 'PENDING',
-                        puntos_home INTEGER,
-                        puntos_away INTEGER,
-                        UNIQUE(event_id, pick)
-                    );
-                """)
-                # Migración one-time desde zcode (si existía)
-                try:
-                    con.execute("""
-                        INSERT OR IGNORE INTO predicciones_allbets
-                        (event_id, fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away)
-                        SELECT event_id, fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away
-                        FROM predicciones_zcode
-                    """)
-                    print("📦 Migración zcode → allbets ejecutada (si había datos).")
-                except Exception:
-                    pass  # no había tabla zcode
-            return
-        except Exception as e:
-            print(f"⚠️ init_db intento {attempt + 1}/3: {e}")
-            _time.sleep(2 ** attempt)
-    raise RuntimeError("No se pudo inicializar Turso tras 3 intentos.")
+    with db() as con:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS predicciones_allbets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT,
+                fecha TEXT,
+                partido TEXT,
+                pick TEXT,
+                linea REAL,
+                cuota REAL,
+                edge REAL,
+                status TEXT DEFAULT 'PENDING',
+                puntos_home INTEGER,
+                puntos_away INTEGER,
+                UNIQUE(event_id, pick)
+            );
+        """)
 
 init_db()
 
 # ==========================================
-# MATEMÁTICA
+# MATEMÁTICA (POISSON)
 # ==========================================
-def normal_cdf(x, mu=0, sigma=1):
-    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+def poisson_pmf(k, lam):
+    if lam <= 0: return 1.0 if k == 0 else 0.0
+    return (math.exp(-lam) * (lam**k)) / math.factorial(k)
+
+def calcular_probabilidades_poisson(proj_home, proj_away, spread_line, total_line):
+    """
+    Calcula las probabilidades usando Distribución de Poisson.
+    Retorna: (prob_home_gana, prob_away_gana, prob_spread_home, prob_spread_away, prob_over, prob_under)
+    """
+    max_puntos = 250 # Límite seguro para iterar
+    prob_home_gana, prob_away_gana = 0.0, 0.0
+    prob_spread_home, prob_spread_away = 0.0, 0.0
+    prob_over, prob_under = 0.0, 0.0
+
+    # Poisson para la suma total de puntos (O/U)
+    total_lambda = proj_home + proj_away
+    for total_pts in range(max_puntos):
+        p_total = poisson_pmf(total_pts, total_lambda)
+        if total_pts > total_line: prob_over += p_total
+        else: prob_under += p_total
+
+    # Poisson bivariado para el margen (Ganador y Spread)
+    for h_pts in range(max_puntos):
+        p_h = poisson_pmf(h_pts, proj_home)
+        if p_h < 1e-8: continue
+        for a_pts in range(max_puntos):
+            p_a = poisson_pmf(a_pts, proj_away)
+            if p_a < 1e-8: continue
+            prob = p_h * p_a
+
+            # Quién gana
+            if h_pts > a_pts: prob_home_gana += prob
+            elif a_pts > h_pts: prob_away_gana += prob
+
+            # Cubrir el Spread
+            margen_home = h_pts - a_pts
+            if margen_home + spread_line > 0: prob_spread_home += prob
+            elif margen_home + spread_line < 0: prob_spread_away += prob
+
+    return prob_home_gana, prob_away_gana, prob_spread_home, prob_spread_away, prob_over, prob_under
 
 def implied_fair_pcts(odds_a, odds_b):
-    """Probabilidades implícitas SIN vig (normalizadas para sumar 100%)."""
-    if odds_a <= 1.0 or odds_b <= 1.0:
-        return 0.0, 0.0
+    if odds_a <= 1.0 or odds_b <= 1.0: return 0.0, 0.0
     ia, ib = 1.0 / odds_a, 1.0 / odds_b
     t = ia + ib
     return 100.0 * ia / t, 100.0 * ib / t
 
 # ==========================================
-# DATOS ESPN
+# ESTADÍSTICAS AVANZADAS (TRIPLE MEDIA)
 # ==========================================
-def get_nba_stats():
-    stats_dict = {}
+def get_advanced_stats():
+    """Calcula promedios de temporada, local/visita, últimos 5 y media de liga."""
     try:
-        url = "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        for conf in data.get("children", []):
-            for entry in conf.get("standings", {}).get("entries", []):
-                team_name = entry["team"]["displayName"]
-                team_id = entry["team"]["id"]
-                pts_for, pts_against = 110.0, 110.0
-                for s in entry.get("stats", []):
-                    if s.get("name") == "avgPointsFor":
-                        pts_for = float(s.get("value", 110.0))
-                    elif s.get("name") == "avgPointsAgainst":
-                        pts_against = float(s.get("value", 110.0))
-                stats_dict[team_name] = {"pf": pts_for, "pa": pts_against, "id": team_id}
-    except Exception as e:
-        print(f"⚠️ Error stats: {e}")
-    return stats_dict
+        # 1. Obtener todos los equipos
+        r_teams = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams", timeout=15)
+        teams = r_teams.json().get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+        
+        stats_dict = {}
+        total_home_pts, total_away_pts, total_games = 0, 0, 0
+        processed_games = set()
 
-def _fetch_injuries_global():
-    """Lista global de lesiones, indexada por team_id."""
-    try:
-        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        by_team = {}
-        for team in data.get("injuries", []):
-            tid = str(team.get("team", {}).get("id", ""))
-            by_team[tid] = team.get("injuries", [])
-        return by_team
+        for t in teams:
+            team_id = t["team"]["id"]
+            team_name = norm(t["team"]["displayName"])
+            
+            # Inicializar contadores
+            pf_gen, pa_gen, gp_gen = 0, 0, 0
+            pf_loc, pa_loc, gp_loc = 0, 0, 0
+            pf_vis, pa_vis, gp_vis = 0, 0, 0
+            last5_pf, last5_pa, last5_gp = 0, 0, 0
+            recent_games = []
+
+            # Obtener calendario
+            r_sched = requests.get(f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule", timeout=15)
+            events = r_sched.json().get("events", [])
+
+            for ev in events:
+                comp = ev.get("competitions", [{}])[0]
+                if not comp.get("status", {}).get("type", {}).get("completed"): continue
+                
+                game_id = ev["id"]
+                is_home = False
+                team_pts, opp_pts = 0, 0
+
+                for c in comp.get("competitors", []):
+                    score = int(c.get("score", {}).get("value", 0) or 0)
+                    if str(c["team"]["id"]) == str(team_id):
+                        team_pts = score
+                        is_home = c["homeAway"] == "home"
+                    else:
+                        opp_pts = score
+
+                # Guardar para liga
+                if game_id not in processed_games:
+                    if is_home:
+                        total_home_pts += team_pts
+                    else:
+                        total_away_pts += team_pts
+                    total_games += 1
+                    processed_games.add(game_id)
+
+                # Acumular para el equipo
+                pf_gen += team_pts
+                pa_gen += opp_pts
+                gp_gen += 1
+
+                if is_home:
+                    pf_loc += team_pts
+                    pa_loc += opp_pts
+                    gp_loc += 1
+                else:
+                    pf_vis += team_pts
+                    pa_vis += opp_pts
+                    gp_vis += 1
+
+                recent_games.append({"pf": team_pts, "pa": opp_pts})
+
+            # Calcular Últimos 5
+            for g in recent_games[-5:]:
+                last5_pf += g["pf"]
+                last5_pa += g["pa"]
+                last5_gp += 1
+
+            stats_dict[team_name] = {
+                "id": team_id,
+                "pf_gen": pf_gen / max(1, gp_gen),
+                "pa_gen": pa_gen / max(1, gp_gen),
+                "pf_loc": pf_loc / max(1, gp_loc),
+                "pa_loc": pa_loc / max(1, gp_loc),
+                "pf_vis": pf_vis / max(1, gp_vis),
+                "pa_vis": pa_vis / max(1, gp_vis),
+                "pf_l5": last5_pf / max(1, last5_gp),
+                "pa_l5": last5_pa / max(1, last5_gp),
+            }
+
+        liga_home_avg = total_home_pts / max(1, total_games / 2)
+        liga_away_avg = total_away_pts / max(1, total_games / 2)
+
+        return {"teams": stats_dict, "liga_home": liga_home_avg, "liga_away": liga_away_avg}
     except Exception as e:
-        print(f"⚠️ Error injuries: {e}")
+        print(f"⚠️ Error advanced stats: {e}")
         return {}
 
-def _fetch_depth(team_id):
-    """Set de titulares (primer jugador de cada posición)."""
+# ==========================================
+# LESIONES
+# ==========================================
+def _fetch_injuries_global():
     try:
-        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/depthchart"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        titulares = set()
-        for group in data.get("depthChart", {}).get("positions", []):
-            if group.get("athletes"):
-                titulares.add(group["athletes"][0]["displayName"])
-        return titulares
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries", timeout=10)
+        by_team = {}
+        for team in r.json().get("injuries", []):
+            by_team[str(team.get("team", {}).get("id", ""))] = team.get("injuries", [])
+        return by_team
     except Exception:
-        return set()
+        return {}
 
 def get_injury_penalty(team_id, injuries_global):
-    """Puntos a restar por lesiones. Recibe el diccionario ya fetcheado."""
     team_injuries = injuries_global.get(str(team_id), [])
-    if not team_injuries:
-        return 0.0, ""
-
-    titulares = get_depth_cached(team_id)
+    if not team_injuries: return 0.0, ""
+    
     penalty = 0.0
     txt = ""
-
     for inj in team_injuries:
         status = inj.get("status", "")
         athlete = inj.get("athlete", {}).get("displayName", "")
         short = athlete.split()[-1] if athlete else ""
-        is_starter = athlete in titulares
-
+        
+        # Aproximación básica (asumimos que los 3 primeros de la lista son titulares)
         if status in ("Out", "Doubtful"):
-            if is_starter:
-                penalty -= 3.5
-                txt += f"❌ {short} (Titular) "
-            else:
-                penalty -= 1.0
-                txt += f"⚠️ {short} (Banca) "
+            penalty -= 2.5
+            txt += f"❌ {short} "
         elif status == "Day-To-Day":
-            if is_starter:
-                penalty -= 1.5
-                txt += f"❓ {short} (Titular) "
-            else:
-                penalty -= 0.5
-                txt += f"❓ {short} (Banca) "
-
+            penalty -= 1.0
+            txt += f"❓ {short} "
     return penalty, txt.strip()
 
 # ==========================================
-# CUOTAS EN 1XBET (THE ODDS API)
+# CUOTAS EN 1XBET (SPREADS + TOTALS)
 # ==========================================
 def get_all_nba_odds():
-    if not ODDS_API_KEY:
-        return {}
-
+    if not ODDS_API_KEY: return {}
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
-    params = {
-        "apiKey": ODDS_API_KEY, "regions": "eu,us",
-        "markets": "spreads", "oddsFormat": "decimal",
-    }
-
+    params = {"apiKey": ODDS_API_KEY, "regions": "eu,us", "markets": "spreads,totals", "oddsFormat": "decimal"}
     try:
         r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return {}
+        if r.status_code != 200: return {}
         games = r.json()
         odds_dict = {}
 
         for game in games:
-            h_api = game.get("home_team", "")
-            a_api = game.get("away_team", "")
+            h_api, a_api = game.get("home_team", ""), game.get("away_team", "")
             key = f"{get_team_key(a_api)}_vs_{get_team_key(h_api)}"
-
             bookmakers = game.get("bookmakers", [])
             book_1xbet = next((b for b in bookmakers if b.get("key") == "onexbet"), None)
-            if not book_1xbet:
-                continue
+            if not book_1xbet: continue
 
-            # Puede haber múltiples líneas alternas: guardar la más cercana a 0
-            candidatos = []
+            data = {"spread": None, "total": None}
             for market in book_1xbet.get("markets", []):
-                if market.get("key") != "spreads":
-                    continue
-                spread = {}
-                for out in market.get("outcomes", []):
-                    if get_team_key(out.get("name", "")) == get_team_key(h_api):
-                        spread["home_line"] = float(out.get("point", 0))
-                        spread["home_odds"] = float(out.get("price", 0))
-                    elif get_team_key(out.get("name", "")) == get_team_key(a_api):
-                        spread["away_line"] = float(out.get("point", 0))
-                        spread["away_odds"] = float(out.get("price", 0))
-                if len(spread) == 4:
-                    candidatos.append(spread)
+                if market.get("key") == "spreads":
+                    spread = {}
+                    for out in market.get("outcomes", []):
+                        if get_team_key(out.get("name", "")) == get_team_key(h_api):
+                            spread["home_line"] = float(out.get("point", 0))
+                            spread["home_odds"] = float(out.get("price", 0))
+                        else:
+                            spread["away_line"] = float(out.get("point", 0))
+                            spread["away_odds"] = float(out.get("price", 0))
+                    if len(spread) == 4: data["spread"] = spread
+                
+                elif market.get("key") == "totals":
+                    total = {}
+                    for out in market.get("outcomes", []):
+                        if out.get("name", "").lower() == "over":
+                            total["line"] = float(out.get("point", 0))
+                            total["over_odds"] = float(out.get("price", 0))
+                        else:
+                            total["under_odds"] = float(out.get("price", 0))
+                    if len(total) == 3: data["total"] = total
 
-            if candidatos:
-                mejor = min(candidatos, key=lambda s: abs(s["home_line"]))
-                odds_dict[key] = {"spread": mejor}
-
+            odds_dict[key] = data
         return odds_dict
     except Exception as e:
         print(f"⚠️ Error odds: {e}")
         return {}
 
 # ==========================================
-# PERSISTENCIA
+# PERSISTENCIA Y AUDITORÍA
 # ==========================================
 def guardar_prediccion(event_id, partido, pick, linea, cuota, edge):
     try:
         with db() as con:
-            existing = con.execute(
-                "SELECT id FROM predicciones_allbets WHERE event_id=? AND pick=?",
-                (event_id, pick),
-            ).fetchone()
-            if existing:
-                return  # ya existía
+            existing = con.execute("SELECT id FROM predicciones_allbets WHERE event_id=? AND pick=?", (event_id, pick)).fetchone()
+            if existing: return
             con.execute("""
-                INSERT INTO predicciones_allbets
-                (event_id, fecha, partido, pick, linea, cuota, edge, status)
+                INSERT INTO predicciones_allbets (event_id, fecha, partido, pick, linea, cuota, edge, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
-            """, (event_id, datetime.now(timezone.utc).isoformat(),
-                  partido, pick, linea, cuota, edge))
+            """, (event_id, datetime.now(timezone.utc).isoformat(), partido, pick, linea, cuota, edge))
             print(f"   ✅ Guardado: {pick} {linea:+.1f} @ {cuota:.2f} (Edge: {edge:.1f}%)")
     except Exception as e:
         print(f"   ❌ Error guardando: {e}")
@@ -352,71 +357,55 @@ def guardar_prediccion(event_id, partido, pick, linea, cuota, edge):
 def auditar_predicciones():
     try:
         with db() as con:
-            pendientes = con.execute(
-                "SELECT id, event_id, pick, linea, fecha "
-                "FROM predicciones_allbets WHERE status='PENDING'"
-            ).fetchall()
-        if not pendientes:
-            return
-
-        r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            timeout=15,
-        )
+            pendientes = con.execute("SELECT id, event_id, pick, linea, fecha FROM predicciones_allbets WHERE status='PENDING'").fetchall()
+        if not pendientes: return
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games = {ev.get("id"): ev for ev in r.json().get("events", [])}
         ahora = datetime.now(timezone.utc)
 
         for pred_id, event_id, pick, linea, fecha_str in pendientes:
-            # Timeout: PENDING > N días → VOID
             try:
                 fecha = datetime.fromisoformat(fecha_str)
-                if fecha.tzinfo is None:
-                    fecha = fecha.replace(tzinfo=timezone.utc)
                 if ahora - fecha > timedelta(days=PENDING_TIMEOUT_DAYS):
-                    with db() as con:
-                        con.execute(
-                            "UPDATE predicciones_allbets SET status='VOID' WHERE id=?",
-                            (pred_id,),
-                        )
+                    with db() as con: con.execute("UPDATE predicciones_allbets SET status='VOID' WHERE id=?", (pred_id,))
                     continue
-            except Exception:
-                pass
+            except: pass
 
             g = games.get(event_id)
-            if not g:
-                continue
-            if g.get("status", {}).get("type", {}).get("state") != "post":
-                continue
+            if not g or g.get("status", {}).get("type", {}).get("state") != "post": continue
 
             comp = g.get("competitions", [{}])[0]
             cs = comp.get("competitors", [])
             home = next((c for c in cs if c.get("homeAway") == "home"), None)
             away = next((c for c in cs if c.get("homeAway") == "away"), None)
-            if not home or not away:
-                continue
+            if not home or not away: continue
 
             pts_home = int(home.get("score", 0))
             pts_away = int(away.get("score", 0))
-            is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
-            margen_final = (
-                (pts_home - pts_away) + linea if is_home_pick
-                else (pts_away - pts_home) + linea
-            )
-            status = "WON" if margen_final > 0 else "LOST" if margen_final < 0 else "PUSH"
+            
+            # Lógica de resolución para Spread y O/U
+            status = "LOST"
+            if "OVER" in pick or "UNDER" in pick:
+                total_final = pts_home + pts_away
+                if "OVER" in pick and total_final > linea: status = "WON"
+                if "UNDER" in pick and total_final < linea: status = "WON"
+                if total_final == linea: status = "PUSH"
+            else:
+                is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
+                margen_final = (pts_home - pts_away) + linea if is_home_pick else (pts_away - pts_home) + linea
+                if margen_final > 0: status = "WON"
+                elif margen_final == 0: status = "PUSH"
 
             with db() as con:
-                con.execute(
-                    "UPDATE predicciones_allbets SET status=?, puntos_home=?, puntos_away=? WHERE id=?",
-                    (status, pts_home, pts_away, pred_id),
-                )
+                con.execute("UPDATE predicciones_allbets SET status=?, puntos_home=?, puntos_away=? WHERE id=?", (status, pts_home, pts_away, pred_id))
     except Exception as e:
         print(f"⚠️ Error auditoría: {e}")
 
 # ==========================================
-# LÓGICA DEL BOT
+# LÓGICA DEL BOT (BACKGROUND)
 # ==========================================
 def procesar_mercado():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA (1xBet)...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA (Triple Media + Poisson)...")
     try:
         _procesar_mercado_inner()
     finally:
@@ -424,102 +413,108 @@ def procesar_mercado():
 
 def _procesar_mercado_inner():
     try:
-        r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            timeout=15,
-        )
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games_raw = r.json().get("events", [])
-    except Exception:
-        return
+    except: return
 
-    partidos_hoy = [
-        g for g in games_raw
-        if g.get("status", {}).get("type", {}).get("state") == "pre"
-    ]
-    if not partidos_hoy:
-        print("💤 No hay partidos próximos. 0 créditos gastados.")
-        return
+    partidos_hoy = [g for g in games_raw if g.get("status", {}).get("type", {}).get("state") == "pre"]
+    if not partidos_hoy: return
 
     odds = _cached("odds", CACHE_ODDS_TTL, get_all_nba_odds)
-    if not odds:
-        print("⚠️ 1xBet aún no abre mercado para estos partidos.")
-        return
+    if not odds: return
 
-    stats = _cached("stats", CACHE_STATS_TTL, get_nba_stats)
+    adv_stats = _cached("adv_stats", CACHE_STATS_TTL, get_advanced_stats)
+    if not adv_stats or "teams" not in adv_stats: return
+    
     injuries_global = _cached("injuries", CACHE_INJURIES_TTL, _fetch_injuries_global)
-    stats_norm = {norm(k): v for k, v in stats.items()}
+    stats_norm = adv_stats["teams"]
+    liga_home = adv_stats["liga_home"]
+    liga_away = adv_stats["liga_away"]
 
     for ev in partidos_hoy:
         comp = ev.get("competitions", [{}])[0]
         cs = comp.get("competitors", [])
-        if len(cs) < 2:
-            continue
+        if len(cs) < 2: continue
         home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
         away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
-
-        h_name = home.get("team", {}).get("displayName", "")
-        a_name = away.get("team", {}).get("displayName", "")
+        h_name, a_name = norm(home.get("team", {}).get("displayName", "")), norm(away.get("team", {}).get("displayName", ""))
         event_id = ev.get("id")
 
-        if norm(h_name) not in stats_norm or norm(a_name) not in stats_norm:
-            print(f"   ⚠️ {a_name} vs {h_name}: falta stats, skip")
-            continue
+        if h_name not in stats_norm or a_name not in stats_norm: continue
 
-        h = stats_norm[norm(h_name)]
-        a = stats_norm[norm(a_name)]
+        h = stats_norm[h_name]
+        a = stats_norm[a_name]
 
-        pen_home, txt_home = get_injury_penalty(h["id"], injuries_global)
-        pen_away, txt_away = get_injury_penalty(a["id"], injuries_global)
+        pen_home, _ = get_injury_penalty(h["id"], injuries_global)
+        pen_away, _ = get_injury_penalty(a["id"], injuries_global)
 
-        proy_home = (h["pf"] + a["pa"]) / 2 + 1.25 + pen_home
-        proy_away = (a["pf"] + h["pa"]) / 2 - 1.25 + pen_away
-        margen = proy_home - proy_away
+        # Fórmula Triple Media
+        ataque_local = (h["pf_gen"] + h["pf_loc"] + h["pf_l5"]) / 3
+        defensa_visita = (a["pa_gen"] + a["pa_vis"] + a["pa_l5"]) / 3
+        proy_home = (ataque_local + defensa_visita + liga_home) / 3 + pen_home
+
+        ataque_visita = (a["pf_gen"] + a["pf_vis"] + a["pf_l5"]) / 3
+        defensa_local = (h["pa_gen"] + h["pa_loc"] + h["pa_l5"]) / 3
+        proy_away = (ataque_visita + defensa_local + liga_away) / 3 + pen_away
 
         key = f"{get_team_key(a_name)}_vs_{get_team_key(h_name)}"
         cuotas = odds.get(key)
-        if not cuotas or not cuotas.get("spread"):
-            continue
+        if not cuotas: continue
 
-        sp = cuotas["spread"]
-        home_line, home_odds = sp["home_line"], sp["home_odds"]
-        away_line, away_odds = sp["away_line"], sp["away_odds"]
+        spread_data = cuotas.get("spread")
+        total_data = cuotas.get("total")
 
-        fair_home_pct, fair_away_pct = implied_fair_pcts(home_odds, away_odds)
-        prob_home = normal_cdf((margen + home_line) / SIGMA) * 100
-        prob_away = normal_cdf((-margen + away_line) / SIGMA) * 100
+        # Calcular Poisson
+        spread_h = spread_data["home_line"] if spread_data else 0
+        spread_a = spread_data["away_line"] if spread_data else 0
+        total_l = total_data["line"] if total_data else 220
 
-        edge_home = prob_home - fair_home_pct
-        edge_away = prob_away - fair_away_pct
+        p_h_win, p_a_win, p_h_spread, p_a_spread, p_over, p_under = calcular_probabilidades_poisson(
+            proy_home, proy_away, spread_h, total_l
+        )
 
-        print(f"🏀 {a_name} vs {h_name} | Lesiones: {txt_home or 'Ninguna'} / {txt_away or 'Ninguna'}")
+        # Evaluar Spread
+        if spread_data:
+            fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
+            edge_h = (p_h_spread * 100) - fair_h
+            edge_a = (p_a_spread * 100) - fair_a
+            
+            if edge_h > EDGE_MIN and edge_h > edge_a:
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", h_name.title(), spread_h, spread_data["home_odds"], edge_h)
+            elif edge_a > EDGE_MIN:
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", a_name.title(), spread_a, spread_data["away_odds"], edge_a)
 
-        if edge_home > EDGE_MIN and edge_away > EDGE_MIN:
-            print(f"   ⚠️ Ambos lados con edge ({edge_home:.1f}% / {edge_away:.1f}%) → probable ruido, skip")
-        elif edge_home > EDGE_MIN:
-            guardar_prediccion(event_id, f"{a_name} vs {h_name}",
-                               h_name, home_line, home_odds, edge_home)
-        elif edge_away > EDGE_MIN:
-            guardar_prediccion(event_id, f"{a_name} vs {h_name}",
-                               a_name, away_line, away_odds, edge_away)
+        # Evaluar Over/Under
+        if total_data:
+            fair_o, fair_u = implied_fair_pcts(total_data["over_odds"], total_data["under_odds"])
+            edge_o = (p_over * 100) - fair_o
+            edge_u = (p_under * 100) - fair_u
+            
+            if edge_o > EDGE_MIN and edge_o > edge_u:
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", "OVER", total_l, total_data["over_odds"], edge_o)
+            elif edge_u > EDGE_MIN:
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", "UNDER", total_l, total_data["under_odds"], edge_u)
 
 # ==========================================
 # RUTAS WEB
 # ==========================================
 @app.get("/")
 def read_root():
-    return {"mensaje": "Allbets — 1xBet + Lesiones. Ve a /predictor o /historial"}
+    return {"mensaje": "Allbets — Triple Media + Poisson. Ve a /predictor o /historial"}
 
 @app.get("/predictor", response_class=HTMLResponse)
 def predictor_html():
-    stats = _cached("stats", CACHE_STATS_TTL, get_nba_stats)
+    adv_stats = _cached("adv_stats", CACHE_STATS_TTL, get_advanced_stats)
+    if not adv_stats or "teams" not in adv_stats:
+        return HTMLResponse("<h1>Calculando estadísticas avanzadas... Recarga en unos segundos.</h1>")
+    
     injuries_global = _cached("injuries", CACHE_INJURIES_TTL, _fetch_injuries_global)
-    stats_norm = {norm(k): v for k, v in stats.items()}
+    stats_norm = adv_stats["teams"]
+    liga_home = adv_stats["liga_home"]
+    liga_away = adv_stats["liga_away"]
 
     try:
-        r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            timeout=15,
-        )
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games_raw = r.json().get("events", [])
     except Exception:
         return HTMLResponse("<h1>Error cargando partidos</h1>")
@@ -530,93 +525,121 @@ def predictor_html():
     for ev in games_raw:
         comp = ev.get("competitions", [{}])[0]
         cs = comp.get("competitors", [])
-        if len(cs) < 2:
-            continue
+        if len(cs) < 2: continue
         home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
         away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
+        h_name, a_name = norm(home.get("team", {}).get("displayName", "")), norm(away.get("team", {}).get("displayName", ""))
 
-        h_name = home.get("team", {}).get("displayName", "")
-        a_name = away.get("team", {}).get("displayName", "")
+        if h_name not in stats_norm or a_name not in stats_norm: continue
 
-        if norm(h_name) not in stats_norm or norm(a_name) not in stats_norm:
-            continue
-
-        h = stats_norm[norm(h_name)]
-        a = stats_norm[norm(a_name)]
+        h = stats_norm[h_name]
+        a = stats_norm[a_name]
 
         pen_home, txt_home = get_injury_penalty(h["id"], injuries_global)
         pen_away, txt_away = get_injury_penalty(a["id"], injuries_global)
 
-        proy_home = (h["pf"] + a["pa"]) / 2 + 1.25 + pen_home
-        proy_away = (a["pf"] + h["pa"]) / 2 - 1.25 + pen_away
-        margen = proy_home - proy_away
+        # Fórmula Triple Media
+        ataque_local = (h["pf_gen"] + h["pf_loc"] + h["pf_l5"]) / 3
+        defensa_visita = (a["pa_gen"] + a["pa_vis"] + a["pa_l5"]) / 3
+        proy_home = (ataque_local + defensa_visita + liga_home) / 3 + pen_home
 
-        prob_home = normal_cdf(margen / SIGMA) * 100
-        prob_away = 100 - prob_home
-        favorito = h_name if prob_home > prob_away else a_name
-        prob_fav = prob_home if prob_home > prob_away else prob_away
+        ataque_visita = (a["pf_gen"] + a["pf_vis"] + a["pf_l5"]) / 3
+        defensa_local = (h["pa_gen"] + h["pa_loc"] + h["pa_l5"]) / 3
+        proy_away = (ataque_visita + defensa_local + liga_away) / 3 + pen_away
 
         key = f"{get_team_key(a_name)}_vs_{get_team_key(h_name)}"
         cuotas = all_odds.get(key)
         valor_html = ""
 
-        if cuotas and cuotas.get("spread"):
-            sp = cuotas["spread"]
-            home_line, home_odds = sp["home_line"], sp["home_odds"]
-            away_line, away_odds = sp["away_line"], sp["away_odds"]
+        if cuotas:
+            spread_data = cuotas.get("spread")
+            total_data = cuotas.get("total")
+            
+            # Probabilidades Poisson (calculadas con línea pregame o default)
+            spread_h = spread_data["home_line"] if spread_data else 0
+            spread_a = spread_data["away_line"] if spread_data else 0
+            total_l = total_data["line"] if total_data else 220
 
-            fair_home_pct, fair_away_pct = implied_fair_pcts(home_odds, away_odds)
-            prob_home_spread = normal_cdf((margen + home_line) / SIGMA) * 100
-            prob_away_spread = normal_cdf((-margen + away_line) / SIGMA) * 100
-            edge_home = prob_home_spread - fair_home_pct
-            edge_away = prob_away_spread - fair_away_pct
-
-            if edge_home > EDGE_MIN:
-                valor_html = (
-                    f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
-                    f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET</div>'
-                    f'<div class="value-bet">{escape(h_name)} {home_line:+.1f} @ {home_odds:.2f}</div>'
-                    f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_home:.1f}%</div></div>'
-                )
-            elif edge_away > EDGE_MIN:
-                valor_html = (
-                    f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
-                    f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET</div>'
-                    f'<div class="value-bet">{escape(a_name)} {away_line:+.1f} @ {away_odds:.2f}</div>'
-                    f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_away:.1f}%</div></div>'
-                )
-            else:
-                valor_html = (
-                    f'<div class="value-box" style="background: rgba(148,163,184,0.1); border-color: #94a3b8;">'
-                    f'<div class="value-title" style="color: #94a3b8;">ANALIZADO (1xBet)</div>'
-                    f'<div class="value-bet">{escape(h_name)} {home_line:+.1f} ({home_odds:.2f}) | '
-                    f'{escape(a_name)} {away_line:+.1f} ({away_odds:.2f})</div>'
-                    f'<div class="value-edge" style="color: #94a3b8;">Sin ventaja clara</div></div>'
-                )
-        else:
-            valor_html = (
-                f'<div class="value-box" style="background: rgba(148,163,184,0.1); border-color: #94a3b8;">'
-                f'<div class="value-title" style="color: #94a3b8;">SIN CUOTAS</div>'
-                f'<div class="value-bet">1xBet no ha abierto el mercado</div></div>'
+            p_h_win, p_a_win, p_h_spread, p_a_spread, p_over, p_under = calcular_probabilidades_poisson(
+                proy_home, proy_away, spread_h, total_l
             )
+
+            prob_home = p_h_win * 100
+            prob_away = p_a_win * 100
+
+            # Mostrar valor en Spread
+            if spread_data:
+                fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
+                edge_h = (p_h_spread * 100) - fair_h
+                edge_a = (p_a_spread * 100) - fair_a
+
+                if edge_h > EDGE_MIN:
+                    valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
+                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Spread)</div>'
+                                  f'<div class="value-bet">{escape(h_name.title())} {spread_h:+.1f} @ {spread_data["home_odds"]:.2f}</div>'
+                                  f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_h:.1f}%</div></div>')
+                elif edge_a > EDGE_MIN:
+                    valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
+                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Spread)</div>'
+                                  f'<div class="value-bet">{escape(a_name.title())} {spread_a:+.1f} @ {spread_data["away_odds"]:.2f}</div>'
+                                  f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_a:.1f}%</div></div>')
+            
+            # Mostrar valor en Over/Under (Si es mayor al 3%)
+            if total_data:
+                fair_o, fair_u = implied_fair_pcts(total_data["over_odds"], total_data["under_odds"])
+                edge_o = (p_over * 100) - fair_o
+                edge_u = (p_under * 100) - fair_u
+
+                if edge_o > EDGE_MIN:
+                    valor_html += (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981; margin-top: 10px;">'
+                                   f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Total)</div>'
+                                   f'<div class="value-bet">OVER {total_l} @ {total_data["over_odds"]:.2f}</div>'
+                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_o:.1f}%</div></div>')
+                elif edge_u > EDGE_MIN:
+                    valor_html += (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981; margin-top: 10px;">'
+                                   f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Total)</div>'
+                                   f'<div class="value-bet">UNDER {total_l} @ {total_data["under_odds"]:.2f}</div>'
+                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_u:.1f}%</div></div>')
+
+            if not valor_html:
+                valor_html = (f'<div class="value-box" style="background: rgba(148,163,184,0.1); border-color: #94a3b8;">'
+                              f'<div class="value-title" style="color: #94a3b8;">ANALIZADO (1xBet)</div>'
+                              f'<div class="value-bet">Sin ventaja clara</div></div>')
+        else:
+            prob_home = 0
+            prob_away = 0
+            valor_html = (f'<div class="value-box" style="background: rgba(148,163,184,0.1); border-color: #94a3b8;">'
+                          f'<div class="value-title" style="color: #94a3b8;">SIN CUOTAS</div>'
+                          f'<div class="value-bet">1xBet no ha abierto el mercado</div></div>')
+
+        # Total Proyectado y Regla O/U
+        total_proyectado = proy_home + proy_away
+        if total_data:
+            linea_pre = total_data["line"]
+            rec_ou = "OVER" if total_proyectado > linea_pre else "UNDER"
+            color_ou = "#10b981" if rec_ou == "OVER" else "#ef4444"
+            ou_html = (f'<div style="margin-top: 10px; text-align: center; font-size: 13px;">'
+                       f'Proyección Total: <b>{total_proyectado:.1f}</b> vs Línea Pregame: <b>{linea_pre}</b><br>'
+                       f'Recomendación: <b style="color:{color_ou};">{rec_ou}</b></div>')
+        else:
+            ou_html = ""
 
         injury_html = ""
         if txt_home or txt_away:
-            injury_html = (
-                f'<div style="font-size:11px; color:#ef4444; text-align:center; margin-top:10px;">'
-                f'<b>Lesiones:</b> {escape(txt_home)} {escape(txt_away)}</div>'
-            )
+            injury_html = (f'<div style="font-size:11px; color:#ef4444; text-align:center; margin-top:10px;">'
+                           f'<b>Lesiones:</b> {escape(txt_home)} {escape(txt_away)}</div>')
 
         html_cards += f"""
         <div class="card">
             <div class="card-header"><div class="league">🏀 NBA</div><div class="time">Hoy</div></div>
             <div class="matchup">
-                <div class="team"><div class="team-name">{escape(a_name)}</div><div class="team-prob">{prob_away:.0f}%</div></div>
-                <div class="vs"><div class="gauge"><div class="gauge-fill" style="width: {prob_fav}%;"></div></div><div class="fav-text">{escape(favorito)}<br>TO WIN</div></div>
-                <div class="team"><div class="team-name">{escape(h_name)}</div><div class="team-prob">{prob_home:.0f}%</div></div>
+                <div class="team"><div class="team-name">{escape(a_name.title())}</div><div class="team-prob">{prob_away:.0f}%</div></div>
+                <div class="vs"><div class="gauge"><div class="gauge-fill" style="width: {prob_home if prob_home > prob_away else prob_away}%;"></div></div><div class="fav-text">{escape(h_name.title() if prob_home > prob_away else a_name.title())}<br>TO WIN</div></div>
+                <div class="team"><div class="team-name">{escape(h_name.title())}</div><div class="team-prob">{prob_home:.0f}%</div></div>
             </div>
-            <div class="projection"><div class="proj-box"><div class="proj-label">PROYECCIÓN ALLBETS</div><div class="proj-score">{proy_away:.0f} - {proy_home:.0f}</div></div></div>
+            <div class="projection"><div class="proj-box"><div class="proj-label">PROYECCIÓN TRIPLE MEDIA</div><div class="proj-score">{proy_away:.0f} - {proy_home:.0f}</div></div></div>
             {valor_html}
+            {ou_html}
             {injury_html}
         </div>
         """
@@ -655,10 +678,7 @@ body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: whit
 @app.get("/historial", response_class=HTMLResponse)
 def historial_html():
     with db() as con:
-        rows = con.execute(
-            "SELECT fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away "
-            "FROM predicciones_allbets ORDER BY id DESC LIMIT 50"
-        ).fetchall()
+        rows = con.execute("SELECT fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away FROM predicciones_allbets ORDER BY id DESC LIMIT 50").fetchall()
 
     won = sum(1 for r in rows if r[6] == "WON")
     lost = sum(1 for r in rows if r[6] == "LOST")
@@ -703,16 +723,12 @@ body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: whit
 </body></html>"""
     return html_out
 
-# ==========================================
-# MODO DEV (opcional)
-# ==========================================
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    # En producción usar: uvicorn app:app --host 0.0.0.0 --port $PORT
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
-
 @app.get("/health")
 @app.head("/health")
 def health_check():
     return {"status": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
