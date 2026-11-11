@@ -1,5 +1,5 @@
 # ==========================================
-# ALLBETS — Value Betting Bot (Triple Media + Poisson)
+# ALLBETS — Value Betting Bot (Triple Media + Poisson + ML)
 # ==========================================
 import math
 import os
@@ -24,7 +24,7 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 # CONFIGURACIÓN
 # ==========================================
 EDGE_MIN             = 3.0    # % mínimo para señal
-CACHE_STATS_TTL      = 86400  # 24 h (Caché de estadísticas avanzadas)
+CACHE_STATS_TTL      = 86400  # 24 h
 CACHE_ODDS_TTL       = 300    # 5 min
 CACHE_INJURIES_TTL   = 1800   # 30 min
 PENDING_TIMEOUT_DAYS = 3
@@ -114,7 +114,6 @@ init_db()
 # MATEMÁTICA (POISSON CORREGIDO)
 # ==========================================
 def generar_poisson_pmf(lam, max_puntos=250):
-    """Genera la lista de probabilidades de Poisson de forma iterativa para evitar Overflow."""
     if lam <= 0:
         return [1.0] + [0.0] * (max_puntos - 1)
     
@@ -127,13 +126,11 @@ def generar_poisson_pmf(lam, max_puntos=250):
         probs.append(p)
     return probs
 
-def calcular_probabilidades_poisson(proj_home, proj_away, spread_line, total_line):
+def calcular_probabilidades_poisson(proj_home, proj_away, total_line):
     max_puntos = 250
     prob_home_gana, prob_away_gana = 0.0, 0.0
-    prob_spread_home, prob_spread_away = 0.0, 0.0
     prob_over, prob_under = 0.0, 0.0
 
-    # 1. Poisson para la suma total de puntos (O/U)
     total_lambda = proj_home + proj_away
     p_total_vals = generar_poisson_pmf(total_lambda, max_puntos)
     
@@ -141,7 +138,6 @@ def calcular_probabilidades_poisson(proj_home, proj_away, spread_line, total_lin
         if total_pts > total_line: prob_over += p_total_vals[total_pts]
         else: prob_under += p_total_vals[total_pts]
 
-    # 2. Poisson bivariado para el margen (Ganador y Spread)
     p_h_vals = generar_poisson_pmf(proj_home, max_puntos)
     p_a_vals = generar_poisson_pmf(proj_away, max_puntos)
 
@@ -151,16 +147,10 @@ def calcular_probabilidades_poisson(proj_home, proj_away, spread_line, total_lin
             if p_a_vals[a_pts] < 1e-10: continue
             prob = p_h_vals[h_pts] * p_a_vals[a_pts]
 
-            # Quién gana
             if h_pts > a_pts: prob_home_gana += prob
             elif a_pts > h_pts: prob_away_gana += prob
 
-            # Cubrir el Spread
-            margen_home = h_pts - a_pts
-            if margen_home + spread_line > 0: prob_spread_home += prob
-            elif margen_home + spread_line < 0: prob_spread_away += prob
-
-    return prob_home_gana, prob_away_gana, prob_spread_home, prob_spread_away, prob_over, prob_under
+    return prob_home_gana, prob_away_gana, prob_over, prob_under
 
 def implied_fair_pcts(odds_a, odds_b):
     if odds_a <= 1.0 or odds_b <= 1.0: return 0.0, 0.0
@@ -172,7 +162,6 @@ def implied_fair_pcts(odds_a, odds_b):
 # ESTADÍSTICAS AVANZADAS (TRIPLE MEDIA)
 # ==========================================
 def get_advanced_stats():
-    """Calcula promedios de temporada, local/visita, últimos 5 y media de liga."""
     try:
         r_teams = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams", timeout=15)
         teams = r_teams.json().get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
@@ -216,15 +205,9 @@ def get_advanced_stats():
                     total_games += 1
                     processed_games.add(game_id)
 
-                pf_gen += team_pts
-                pa_gen += opp_pts
-                gp_gen += 1
-
-                if is_home:
-                    pf_loc += team_pts; pa_loc += opp_pts; gp_loc += 1
-                else:
-                    pf_vis += team_pts; pa_vis += opp_pts; gp_vis += 1
-
+                pf_gen += team_pts; pa_gen += opp_pts; gp_gen += 1
+                if is_home: pf_loc += team_pts; pa_loc += opp_pts; gp_loc += 1
+                else: pf_vis += team_pts; pa_vis += opp_pts; gp_vis += 1
                 recent_games.append({"pf": team_pts, "pa": opp_pts})
 
             for g in recent_games[-5:]:
@@ -279,12 +262,12 @@ def get_injury_penalty(team_id, injuries_global):
     return penalty, txt.strip()
 
 # ==========================================
-# CUOTAS EN 1XBET (SPREADS + TOTALS)
+# CUOTAS EN 1XBET (MONEYLINE + TOTALS)
 # ==========================================
 def get_all_nba_odds():
     if not ODDS_API_KEY: return {}
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": "eu,us", "markets": "spreads,totals", "oddsFormat": "decimal"}
+    params = {"apiKey": ODDS_API_KEY, "regions": "eu,us", "markets": "h2h,totals", "oddsFormat": "decimal"}
     try:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200: return {}
@@ -298,18 +281,16 @@ def get_all_nba_odds():
             book_1xbet = next((b for b in bookmakers if b.get("key") == "onexbet"), None)
             if not book_1xbet: continue
 
-            data = {"spread": None, "total": None}
+            data = {"moneyline": None, "total": None}
             for market in book_1xbet.get("markets", []):
-                if market.get("key") == "spreads":
-                    spread = {}
+                if market.get("key") == "h2h":
+                    ml = {}
                     for out in market.get("outcomes", []):
                         if get_team_key(out.get("name", "")) == get_team_key(h_api):
-                            spread["home_line"] = float(out.get("point", 0))
-                            spread["home_odds"] = float(out.get("price", 0))
+                            ml["home_odds"] = float(out.get("price", 0))
                         else:
-                            spread["away_line"] = float(out.get("point", 0))
-                            spread["away_odds"] = float(out.get("price", 0))
-                    if len(spread) == 4: data["spread"] = spread
+                            ml["away_odds"] = float(out.get("price", 0))
+                    if len(ml) == 2: data["moneyline"] = ml
                 
                 elif market.get("key") == "totals":
                     total = {}
@@ -379,10 +360,12 @@ def auditar_predicciones():
                 if "UNDER" in pick and total_final < linea: status = "WON"
                 if total_final == linea: status = "PUSH"
             else:
+                # Moneyline pick
                 is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
-                margen_final = (pts_home - pts_away) + linea if is_home_pick else (pts_away - pts_home) + linea
-                if margen_final > 0: status = "WON"
-                elif margen_final == 0: status = "PUSH"
+                if (is_home_pick and pts_home > pts_away) or (not is_home_pick and pts_away > pts_home):
+                    status = "WON"
+                elif pts_home == pts_away:
+                    status = "PUSH"
 
             with db() as con:
                 con.execute("UPDATE predicciones_allbets SET status=?, puntos_home=?, puntos_away=? WHERE id=?", (status, pts_home, pts_away, pred_id))
@@ -393,7 +376,7 @@ def auditar_predicciones():
 # LÓGICA DEL BOT (BACKGROUND)
 # ==========================================
 def procesar_mercado():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA (Triple Media + Poisson)...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA (ML + Totales)...")
     try:
         _procesar_mercado_inner()
     finally:
@@ -448,26 +431,24 @@ def _procesar_mercado_inner():
         cuotas = odds.get(key)
         if not cuotas: continue
 
-        spread_data = cuotas.get("spread")
+        ml_data = cuotas.get("moneyline")
         total_data = cuotas.get("total")
 
-        spread_h = spread_data["home_line"] if spread_data else 0
-        spread_a = spread_data["away_line"] if spread_data else 0
         total_l = total_data["line"] if total_data else 220
 
-        p_h_win, p_a_win, p_h_spread, p_a_spread, p_over, p_under = calcular_probabilidades_poisson(
-            proy_home, proy_away, spread_h, total_l
+        p_h_win, p_a_win, p_over, p_under = calcular_probabilidades_poisson(
+            proy_home, proy_away, total_l
         )
 
-        if spread_data:
-            fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
-            edge_h = (p_h_spread * 100) - fair_h
-            edge_a = (p_a_spread * 100) - fair_a
+        if ml_data:
+            fair_h, fair_a = implied_fair_pcts(ml_data["home_odds"], ml_data["away_odds"])
+            edge_h = (p_h_win * 100) - fair_h
+            edge_a = (p_a_win * 100) - fair_a
             
             if edge_h > EDGE_MIN and edge_h > edge_a:
-                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", h_name.title(), spread_h, spread_data["home_odds"], edge_h)
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", h_name.title(), 0, ml_data["home_odds"], edge_h)
             elif edge_a > EDGE_MIN:
-                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", a_name.title(), spread_a, spread_data["away_odds"], edge_a)
+                guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", a_name.title(), 0, ml_data["away_odds"], edge_a)
 
         if total_data:
             fair_o, fair_u = implied_fair_pcts(total_data["over_odds"], total_data["under_odds"])
@@ -484,7 +465,7 @@ def _procesar_mercado_inner():
 # ==========================================
 @app.get("/")
 def read_root():
-    return {"mensaje": "Allbets — Triple Media + Poisson. Ve a /predictor o /historial"}
+    return {"mensaje": "Allbets — ML + Totales. Ve a /predictor o /historial"}
 
 @app.get("/predictor", response_class=HTMLResponse)
 def predictor_html():
@@ -535,34 +516,32 @@ def predictor_html():
         valor_html = ""
 
         if cuotas:
-            spread_data = cuotas.get("spread")
+            ml_data = cuotas.get("moneyline")
             total_data = cuotas.get("total")
             
-            spread_h = spread_data["home_line"] if spread_data else 0
-            spread_a = spread_data["away_line"] if spread_data else 0
             total_l = total_data["line"] if total_data else 220
 
-            p_h_win, p_a_win, p_h_spread, p_a_spread, p_over, p_under = calcular_probabilidades_poisson(
-                proy_home, proy_away, spread_h, total_l
+            p_h_win, p_a_win, p_over, p_under = calcular_probabilidades_poisson(
+                proy_home, proy_away, total_l
             )
 
             prob_home = p_h_win * 100
             prob_away = p_a_win * 100
 
-            if spread_data:
-                fair_h, fair_a = implied_fair_pcts(spread_data["home_odds"], spread_data["away_odds"])
-                edge_h = (p_h_spread * 100) - fair_h
-                edge_a = (p_a_spread * 100) - fair_a
+            if ml_data:
+                fair_h, fair_a = implied_fair_pcts(ml_data["home_odds"], ml_data["away_odds"])
+                edge_h = (p_h_win * 100) - fair_h
+                edge_a = (p_a_win * 100) - fair_a
 
                 if edge_h > EDGE_MIN:
                     valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
-                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Spread)</div>'
-                                  f'<div class="value-bet">{escape(h_name.title())} {spread_h:+.1f} @ {spread_data["home_odds"]:.2f}</div>'
+                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (ML)</div>'
+                                  f'<div class="value-bet">{escape(h_name.title())} (Gana) @ {ml_data["home_odds"]:.2f}</div>'
                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_h:.1f}%</div></div>')
                 elif edge_a > EDGE_MIN:
                     valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
-                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (Spread)</div>'
-                                  f'<div class="value-bet">{escape(a_name.title())} {spread_a:+.1f} @ {spread_data["away_odds"]:.2f}</div>'
+                                  f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (ML)</div>'
+                                  f'<div class="value-bet">{escape(a_name.title())} (Gana) @ {ml_data["away_odds"]:.2f}</div>'
                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_a:.1f}%</div></div>')
             
             if total_data:
