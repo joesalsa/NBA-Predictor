@@ -23,7 +23,7 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-EDGE_MIN             = 3.0    # % mínimo para señal
+EDGE_MIN             = 3.0    # % mínimo para considerar que hay "Valor"
 CACHE_STATS_TTL      = 86400  # 24 h
 CACHE_ODDS_TTL       = 300    # 5 min
 CACHE_INJURIES_TTL   = 1800   # 30 min
@@ -71,7 +71,7 @@ scheduler = BackgroundScheduler(timezone="UTC")
 async def lifespan(app: FastAPI):
     scheduler.add_job(procesar_mercado, "interval", minutes=60, id="allbets_job", coalesce=True, max_instances=1)
     scheduler.start()
-    print("🚀 Scheduler iniciado: buscando valor en 1xBet cada 60 minutos.")
+    print("🚀 Scheduler iniciado: guardando historial de predicciones cada 60 minutos.")
     yield
     scheduler.shutdown()
 
@@ -116,11 +116,9 @@ init_db()
 def generar_poisson_pmf(lam, max_puntos=250):
     if lam <= 0:
         return [1.0] + [0.0] * (max_puntos - 1)
-    
     probs = []
     p = math.exp(-lam)
     probs.append(p)
-    
     for k in range(1, max_puntos):
         p = p * lam / k
         probs.append(p)
@@ -360,7 +358,6 @@ def auditar_predicciones():
                 if "UNDER" in pick and total_final < linea: status = "WON"
                 if total_final == linea: status = "PUSH"
             else:
-                # Moneyline pick
                 is_home_pick = get_team_key(pick) == get_team_key(home["team"]["displayName"])
                 if (is_home_pick and pts_home > pts_away) or (not is_home_pick and pts_away > pts_home):
                     status = "WON"
@@ -376,7 +373,7 @@ def auditar_predicciones():
 # LÓGICA DEL BOT (BACKGROUND)
 # ==========================================
 def procesar_mercado():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA (ML + Totales)...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Analizando jornada NBA y guardando historial...")
     try:
         _procesar_mercado_inner()
     finally:
@@ -440,14 +437,15 @@ def _procesar_mercado_inner():
             proy_home, proy_away, total_l
         )
 
+        # GUARDAR SIEMPRE (El Edge se calcula, pero no filtra el guardado)
         if ml_data:
             fair_h, fair_a = implied_fair_pcts(ml_data["home_odds"], ml_data["away_odds"])
             edge_h = (p_h_win * 100) - fair_h
             edge_a = (p_a_win * 100) - fair_a
             
-            if edge_h > EDGE_MIN and edge_h > edge_a:
+            if p_h_win >= p_a_win:
                 guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", h_name.title(), 0, ml_data["home_odds"], edge_h)
-            elif edge_a > EDGE_MIN:
+            else:
                 guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", a_name.title(), 0, ml_data["away_odds"], edge_a)
 
         if total_data:
@@ -455,9 +453,9 @@ def _procesar_mercado_inner():
             edge_o = (p_over * 100) - fair_o
             edge_u = (p_under * 100) - fair_u
             
-            if edge_o > EDGE_MIN and edge_o > edge_u:
+            if p_over >= p_under:
                 guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", "OVER", total_l, total_data["over_odds"], edge_o)
-            elif edge_u > EDGE_MIN:
+            else:
                 guardar_prediccion(event_id, f"{h_name.title()} vs {a_name.title()}", "UNDER", total_l, total_data["under_odds"], edge_u)
 
 # ==========================================
@@ -533,12 +531,12 @@ def predictor_html():
                 edge_h = (p_h_win * 100) - fair_h
                 edge_a = (p_a_win * 100) - fair_a
 
-                if edge_h > EDGE_MIN:
+                if p_h_win >= p_a_win and edge_h > EDGE_MIN:
                     valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
                                   f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (ML)</div>'
                                   f'<div class="value-bet">{escape(h_name.title())} (Gana) @ {ml_data["home_odds"]:.2f}</div>'
                                   f'<div class="value-edge" style="color: #10b981;">Edge: +{edge_h:.1f}%</div></div>')
-                elif edge_a > EDGE_MIN:
+                elif p_a_win > p_h_win and edge_a > EDGE_MIN:
                     valor_html = (f'<div class="value-box" style="background: rgba(16,185,129,0.1); border-color: #10b981;">'
                                   f'<div class="value-title" style="color: #10b981;">💎 VALOR EN 1XBET (ML)</div>'
                                   f'<div class="value-bet">{escape(a_name.title())} (Gana) @ {ml_data["away_odds"]:.2f}</div>'
@@ -636,7 +634,7 @@ body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: whit
 @app.get("/historial", response_class=HTMLResponse)
 def historial_html():
     with db() as con:
-        rows = con.execute("SELECT fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away FROM predicciones_allbets ORDER BY id DESC LIMIT 50").fetchall()
+        rows = con.execute("SELECT fecha, partido, pick, linea, cuota, edge, status, puntos_home, puntos_away FROM predicciones_allbets ORDER BY id DESC LIMIT 100").fetchall()
 
     won = sum(1 for r in rows if r[6] == "WON")
     lost = sum(1 for r in rows if r[6] == "LOST")
@@ -645,25 +643,35 @@ def historial_html():
     html_cards = ""
     for r in rows:
         fecha, partido, pick, linea, cuota, edge, status, ph, pa = r
+        
+        # Determinar si fue Value o No Value
+        is_value = edge >= EDGE_MIN
+        value_badge = '<span style="color:#10b981; font-size:10px; font-weight:bold;">💎 VALUE</span>' if is_value else '<span style="color:#64748b; font-size:10px;">NO VALUE</span>'
+        
         color = {"WON": "#10b981", "LOST": "#ef4444", "VOID": "#64748b"}.get(status, "#eab308")
         score_txt = f"{ph} - {pa}" if ph is not None else "-"
+        
+        linea_txt = f" {linea:+.1f}" if linea != 0 else ""
+        
         html_cards += (
             f'<div class="card" style="border-left: 4px solid {color};">'
-            f'<div style="display:flex; justify-content:space-between; margin-bottom:10px;">'
+            f'<div style="display:flex; justify-content:space-between; margin-bottom:5px;">'
             f'<span style="font-weight:bold;">{escape(partido)}</span>'
             f'<span style="color:{color}; font-weight:bold;">{escape(status)}</span></div>'
-            f'<div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:5px;">'
-            f'<span>💡 {escape(pick)} {linea:+.1f} @ {cuota:.2f}</span>'
-            f'<span>Edge: +{edge:.1f}%</span></div>'
-            f'<div style="font-size:12px; color:#94a3b8; text-align:center; margin-top:10px; padding-top:10px; border-top:1px solid #334155;">'
-            f'Marcador Final: {score_txt}</div></div>'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; font-size:14px; margin-bottom:5px;">'
+            f'<span>💡 {escape(pick)}{linea_txt} @ {cuota:.2f}</span>'
+            f'{value_badge}</div>'
+            f'<div style="display:flex; justify-content:space-between; font-size:11px; color:#94a3b8;">'
+            f'<span>Edge: {edge:+.1f}%</span>'
+            f'<span>Final: {score_txt}</span></div>'
+            f'</div>'
         )
 
     html_out = f"""<!DOCTYPE html><html><head><title>Historial Allbets</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: white; padding: 16px; max-width: 500px; margin: auto; }}
-.card {{ background: #1e293b; border-radius: 16px; padding: 20px; margin-bottom: 15px; border: 1px solid #334155; }}
+.card {{ background: #1e293b; border-radius: 12px; padding: 15px; margin-bottom: 10px; border: 1px solid #334155; }}
 .nav {{ text-align: center; margin-bottom: 20px; }}
 .nav a {{ color: #eab308; text-decoration: none; font-weight: bold; margin: 0 10px; }}
 .stats {{ display:flex; gap:10px; margin-bottom:20px; }}
@@ -671,13 +679,13 @@ body {{ font-family: -apple-system, sans-serif; background: #0b1120; color: whit
 .stat-val {{ font-size:24px; font-weight:bold; }}
 </style></head><body>
 <div class="nav"><a href="/predictor">Predicciones</a> | <a href="/historial">Historial</a></div>
-<h2 style="font-size: 18px; margin-bottom: 20px;">Historial de Apuestas</h2>
+<h2 style="font-size: 18px; margin-bottom: 20px;">Historial de Predicciones</h2>
 <div class="stats">
   <div class="stat"><div style="font-size:12px; color:#94a3b8;">GANADAS</div><div class="stat-val" style="color:#10b981;">{won}</div></div>
   <div class="stat"><div style="font-size:12px; color:#94a3b8;">PERDIDAS</div><div class="stat-val" style="color:#ef4444;">{lost}</div></div>
   <div class="stat"><div style="font-size:12px; color:#94a3b8;">VOID</div><div class="stat-val" style="color:#64748b;">{void}</div></div>
 </div>
-{html_cards if html_cards else "<p style='text-align:center;'>No hay apuestas registradas aún.</p>"}
+{html_cards if html_cards else "<p style='text-align:center;'>No hay predicciones registradas aún.</p>"}
 </body></html>"""
     return html_out
 
