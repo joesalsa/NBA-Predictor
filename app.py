@@ -437,7 +437,6 @@ def _procesar_mercado_inner():
             proy_home, proy_away, total_l
         )
 
-        # GUARDAR SIEMPRE (El Edge se calcula, pero no filtra el guardado)
         if ml_data:
             fair_h, fair_a = implied_fair_pcts(ml_data["home_odds"], ml_data["away_odds"])
             edge_h = (p_h_win * 100) - fair_h
@@ -512,6 +511,10 @@ def predictor_html():
         key = f"{get_team_key(a_name)}_vs_{get_team_key(h_name)}"
         cuotas = all_odds.get(key)
         valor_html = ""
+        
+        # INICIALIZAMOS VARIABLES PARA EVITAR ERRORES
+        ml_data = None
+        total_data = None
 
         if cuotas:
             ml_data = cuotas.get("moneyline")
@@ -644,7 +647,6 @@ def historial_html():
     for r in rows:
         fecha, partido, pick, linea, cuota, edge, status, ph, pa = r
         
-        # Determinar si fue Value o No Value
         is_value = edge >= EDGE_MIN
         value_badge = '<span style="color:#10b981; font-size:10px; font-weight:bold;">💎 VALUE</span>' if is_value else '<span style="color:#64748b; font-size:10px;">NO VALUE</span>'
         
