@@ -27,6 +27,7 @@ EDGE_MIN             = 3.0    # % mínimo para considerar que hay "Valor"
 CACHE_STATS_TTL      = 86400  # 24 h
 CACHE_ODDS_TTL       = 300    # 5 min
 CACHE_INJURIES_TTL   = 1800   # 30 min
+CACHE_DEPTH_TTL      = 86400  # 24 h (Nuevo: para no saturar a ESPN con los Depth Charts)
 PENDING_TIMEOUT_DAYS = 3
 
 TEAM_KEYS = {
@@ -61,6 +62,18 @@ def _cached(key, ttl_sec, fn):
     v = fn()
     _CACHE[key] = {"t": now, "v": v}
     return v
+
+# Caché específico para Depth Charts
+_DEPTH_CACHE = {}
+
+def get_depth_cached(team_id):
+    now = _time.time()
+    entry = _DEPTH_CACHE.get(str(team_id))
+    if entry and now - entry[0] < CACHE_DEPTH_TTL:
+        return entry[1]
+    starters = _fetch_depth(team_id)
+    _DEPTH_CACHE[str(team_id)] = (now, starters)
+    return starters
 
 # ==========================================
 # SCHEDULER Y LIFESPAN
@@ -228,7 +241,7 @@ def get_advanced_stats():
         return {}
 
 # ==========================================
-# LESIONES
+# LESIONES Y DEPTH CHART
 # ==========================================
 def _fetch_injuries_global():
     try:
@@ -240,23 +253,48 @@ def _fetch_injuries_global():
     except Exception:
         return {}
 
+def _fetch_depth(team_id):
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/depthchart"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        titulares = set()
+        for group in data.get("depthChart", {}).get("positions", []):
+            if group.get("athletes"):
+                titulares.add(group["athletes"][0]["displayName"])
+        return titulares
+    except Exception:
+        return set()
+
 def get_injury_penalty(team_id, injuries_global):
     team_injuries = injuries_global.get(str(team_id), [])
     if not team_injuries: return 0.0, ""
     
+    titulares = get_depth_cached(team_id)
     penalty = 0.0
     txt = ""
+
     for inj in team_injuries:
         status = inj.get("status", "")
         athlete = inj.get("athlete", {}).get("displayName", "")
         short = athlete.split()[-1] if athlete else ""
-        
+        is_starter = athlete in titulares
+
         if status in ("Out", "Doubtful"):
-            penalty -= 2.5
-            txt += f"❌ {short} "
+            if is_starter:
+                penalty -= 3.5
+                txt += f"❌ {short} (Titular) "
+            else:
+                penalty -= 1.0
+                txt += f"⚠️ {short} (Banca) "
         elif status == "Day-To-Day":
-            penalty -= 1.0
-            txt += f"❓ {short} "
+            if is_starter:
+                penalty -= 1.5
+                txt += f"❓ {short} (Titular) "
+            else:
+                penalty -= 0.5
+                txt += f"❓ {short} (Banca) "
+
     return penalty, txt.strip()
 
 # ==========================================
@@ -512,7 +550,6 @@ def predictor_html():
         cuotas = all_odds.get(key)
         valor_html = ""
         
-        # INICIALIZAMOS VARIABLES PARA EVITAR ERRORES
         ml_data = None
         total_data = None
 
